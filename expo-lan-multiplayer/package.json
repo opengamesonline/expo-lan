@@ -1,0 +1,24 @@
+{
+  "name": "@opengamesonline/expo-lan-multiplayer",
+  "version": "0.1.0",
+  "description": "Host-authoritative LAN multiplayer sessions for Expo apps.",
+  "main": "build/index.js",
+  "react-native": "src/index.ts",
+  "types": "build/index.d.ts",
+  "files": [
+    "build"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "prepack": "npm run build",
+    "test": "npm run build && node --test test/*.test.cjs"
+  },
+  "peerDependencies": {
+    "@opengamesonline/expo-lan-sockets": "^0.1.0"
+  },
+  "devDependencies": {
+    "@opengamesonline/expo-lan-sockets": "file:../expo-lan-sockets",
+    "typescript": "^5.9.2"
+  },
+  "license": "MIT"
+}

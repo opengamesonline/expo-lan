@@ -3,6 +3,7 @@
   "version": "0.1.0",
   "description": "Module for LAN connectivity between iOS and Android devices for expo projects.",
   "main": "build/index.js",
+  "react-native": "src/index.ts",
   "types": "build/index.d.ts",
   "scripts": {
     "build": "node internal/module_scripts/build.js",

@@ -34,6 +34,7 @@ export default function App() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const unsubscribeSession = useRef<(() => void) | null>(null);
+  const joinAttempt = useRef(0);
 
   useEffect(() => multiplayer.subscribeToGames(setGames), []);
 
@@ -84,15 +85,20 @@ export default function App() {
   }
 
   async function joinGame(service: DiscoveredService) {
+    const attempt = ++joinAttempt.current;
     setBusy(true);
     setError(null);
     try {
       const nextSession = await multiplayer.joinGame<TileState, TileEvent>({ service, playerName });
+      if (attempt !== joinAttempt.current) {
+        await nextSession.leaveGame();
+        return;
+      }
       watchSession(nextSession);
     } catch (cause) {
-      setError(errorMessage(cause));
+      if (attempt === joinAttempt.current) setError(errorMessage(cause));
     } finally {
-      setBusy(false);
+      if (attempt === joinAttempt.current) setBusy(false);
     }
   }
 
@@ -114,8 +120,15 @@ export default function App() {
   }
 
   async function backFromGames() {
-    await multiplayer.stopDiscovery();
+    joinAttempt.current += 1;
+    multiplayer.cancelPendingJoin();
+    setBusy(false);
     setScreen('home');
+    try {
+      await multiplayer.stopDiscovery();
+    } catch (cause) {
+      setError(errorMessage(cause));
+    }
   }
 
   async function claimTile(tile: number) {
@@ -229,11 +242,11 @@ function Games(props: {
         <View style={styles.empty}><ActivityIndicator color="#36C5A3" /><Text style={styles.emptyText}>Waiting for a host</Text></View>
       ) : props.games.map((game) => (
         <Pressable key={game.serviceId} style={styles.gameRow} disabled={props.busy} onPress={() => props.onJoin(game)}>
-          <View><Text style={styles.gameName}>{game.name}</Text><Text style={styles.gameType}>LAN GAME</Text></View>
+          <View style={styles.gameInfo}><Text style={styles.gameName}>{game.name}</Text><Text style={styles.gameType}>LAN GAME</Text></View>
           <Text style={styles.join}>JOIN</Text>
         </Pressable>
       ))}
-      <ActionButton label="Back" disabled={props.busy} onPress={props.onBack} />
+      <ActionButton label="Back" onPress={props.onBack} />
     </View>
   );
 }
@@ -379,9 +392,10 @@ const styles = StyleSheet.create({
   emptyText: { color: '#8D90A5', fontSize: 14 },
   waiting: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 10, minHeight: 50, marginTop: 8 },
   gameRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', borderBottomWidth: 1, borderBottomColor: '#303241', paddingVertical: 17 },
+  gameInfo: { flex: 1, minWidth: 0, marginRight: 12 },
   gameName: { color: '#F5F3EE', fontSize: 17, fontWeight: '800' },
   gameType: { color: '#6F7184', fontSize: 9, fontWeight: '800', letterSpacing: 1.3, marginTop: 4 },
-  join: { color: '#36C5A3', fontSize: 12, fontWeight: '900', letterSpacing: 1.2 },
+  join: { flexShrink: 0, color: '#36C5A3', fontSize: 12, fontWeight: '900', letterSpacing: 1.2 },
   sessionHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
   status: { color: '#8D90A5', fontSize: 10, fontWeight: '800', letterSpacing: 1.1, marginTop: 7 },
   selfColor: { width: 34, height: 34, borderRadius: 11, borderWidth: 3, borderColor: '#F5F3EE' },

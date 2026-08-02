@@ -15,7 +15,7 @@
         
       in
       {
-        devShells.default = pkgs.mkShell {
+        devShells.default = pkgs.mkShellNoCC {
           name = "Sudokuru";
           buildInputs = with pkgs; [
             git
@@ -28,7 +28,7 @@
 
           shellHook = ''
             echo "⚡ Pinned NixOS 26.05 Development Environment Activated ⚡"
-            export PROJECT_ROOT=$(pwd)
+            export EXPO_LAN_ROOT=$(pwd)
             pre-commit install
             stools() {
               echo "Available tools: $(git --version), $(jq --version), node $(node --version), npm $(npm --version), $(pre-commit --version), bun $(bun --version), $(gh --version)"

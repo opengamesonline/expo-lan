@@ -13,13 +13,16 @@
   },
   "devDependencies": {
     "@types/react": "~19.2.2",
+    "bonjour-service": "^1.4.4",
     "typescript": "~6.0.3"
   },
   "scripts": {
     "start": "expo start --dev-client --lan",
+    "bridge": "zsh scripts/emulator-bridge.zsh",
     "android": "expo run:android",
     "android:device": "expo run:android --device",
     "check": "tsc --noEmit",
+    "test:bridge": "node --test scripts/emulator-bridge.test.cjs",
     "test:android:sockets": "android/gradlew -p android :opengamesonline-expo-lan-sockets:connectedDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.class=com.opengamesonline.expolansockets.TcpManagerInstrumentedTest",
     "ios": "expo run:ios",
     "web": "expo start --web"

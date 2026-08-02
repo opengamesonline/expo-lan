@@ -47,6 +47,9 @@ class ExpoLanSocketsModule : Module() {
   private var registrationListener: NsdManager.RegistrationListener? = null
   private var serverStopPromise: Promise? = null
   private var discoveryListener: NsdManager.DiscoveryListener? = null
+  private var discoveryStopping = false
+  private val discoveryStopPromises = mutableListOf<Promise>()
+  private val pendingDiscoveryStarts = mutableListOf<Pair<String, Promise>>()
   private var multicastLock: WifiManager.MulticastLock? = null
   private var multicastUsers = 0
   private var destroyed = false
@@ -218,11 +221,30 @@ class ExpoLanSocketsModule : Module() {
   }
 
   private fun startDiscovery(serviceType: String, promise: Promise) {
-    synchronized(stateLock) {
-      if (discoveryListener != null) {
-        promise.reject("ERR_DISCOVERY_ALREADY_RUNNING", "Service discovery is already running", null)
-        return
+    val discoveryState = synchronized(stateLock) {
+      when {
+        discoveryStopping -> {
+          pendingDiscoveryStarts += serviceType to promise
+          2
+        }
+        discoveryListener != null -> 1
+        else -> 0
       }
+    }
+    if (discoveryState == 2) return
+    if (discoveryState == 1) {
+      discoveredServices.forEach { (serviceId, serviceInfo) ->
+        sendEvent(
+          "onServiceFound",
+          mapOf(
+            "serviceId" to serviceId,
+            "name" to serviceInfo.serviceName,
+            "type" to serviceInfo.serviceType
+          )
+        )
+      }
+      promise.resolve()
+      return
     }
 
     val listener = object : NsdManager.DiscoveryListener {
@@ -250,7 +272,9 @@ class ExpoLanSocketsModule : Module() {
         sendEvent("onServiceLost", mapOf("serviceId" to serviceId))
       }
 
-      override fun onDiscoveryStopped(serviceType: String) = Unit
+      override fun onDiscoveryStopped(serviceType: String) {
+        completeDiscoveryStop(releaseLock = true)
+      }
 
       override fun onStartDiscoveryFailed(serviceType: String, errorCode: Int) {
         synchronized(stateLock) { discoveryListener = null }
@@ -259,7 +283,7 @@ class ExpoLanSocketsModule : Module() {
       }
 
       override fun onStopDiscoveryFailed(serviceType: String, errorCode: Int) {
-        emitError("ERR_DISCOVERY_STOP", "Stopping NSD discovery failed ($errorCode)", "discovery")
+        failDiscoveryStop("Stopping NSD discovery failed ($errorCode)")
       }
     }
 
@@ -275,26 +299,60 @@ class ExpoLanSocketsModule : Module() {
   }
 
   private fun stopDiscovery(promise: Promise?) {
+    var alreadyStopping = false
     val listener = synchronized(stateLock) {
+      if (promise != null) discoveryStopPromises += promise
+      if (discoveryStopping) {
+        alreadyStopping = true
+        return@synchronized null
+      }
       val current = discoveryListener
       discoveryListener = null
+      discoveryStopping = current != null
       current
     }
     discoveredServices.clear()
     discoveredServiceIds.clear()
+    if (alreadyStopping) return
     if (listener == null) {
-      promise?.resolve()
+      completeDiscoveryStop(releaseLock = false)
       return
     }
 
     try {
       nsdManager.stopServiceDiscovery(listener)
-      releaseMulticast()
-      promise?.resolve()
     } catch (error: Exception) {
-      releaseMulticast()
-      promise?.reject("ERR_DISCOVERY_STOP", error.message ?: "Could not stop discovery", error)
+      failDiscoveryStop(error.message ?: "Could not stop discovery", error)
     }
+  }
+
+  private fun completeDiscoveryStop(releaseLock: Boolean) {
+    val (promises, starts) = synchronized(stateLock) {
+      discoveryStopping = false
+      val promises = discoveryStopPromises.toList()
+      val starts = pendingDiscoveryStarts.toList()
+      discoveryStopPromises.clear()
+      pendingDiscoveryStarts.clear()
+      promises to starts
+    }
+    if (releaseLock) releaseMulticast()
+    promises.forEach { it.resolve() }
+    starts.forEach { (serviceType, promise) -> startDiscovery(serviceType, promise) }
+  }
+
+  private fun failDiscoveryStop(message: String, cause: Exception? = null) {
+    val (promises, starts) = synchronized(stateLock) {
+      discoveryStopping = false
+      val promises = discoveryStopPromises.toList()
+      val starts = pendingDiscoveryStarts.toList()
+      discoveryStopPromises.clear()
+      pendingDiscoveryStarts.clear()
+      promises to starts
+    }
+    releaseMulticast()
+    promises.forEach { it.reject("ERR_DISCOVERY_STOP", message, cause) }
+    starts.forEach { (_, promise) -> promise.reject("ERR_DISCOVERY_START", message, cause) }
+    if (promises.isEmpty() && starts.isEmpty()) emitError("ERR_DISCOVERY_STOP", message, "discovery")
   }
 
   @Suppress("DEPRECATION")

@@ -1,21 +1,23 @@
 # Expo LAN
 
-Android-first LAN multiplayer for Expo applications.
+Native LAN multiplayer transport and host-authoritative sessions for Expo applications.
 
 ## Packages
 
 - `@opengamesonline/expo-lan-sockets` wraps Android `NsdManager`, `ServerSocket`, and `Socket` for native service discovery and TCP transport.
+- On iOS, the socket package uses `NWListener`, `NWBrowser`, and `NWConnection` from Network.framework.
 - `@opengamesonline/expo-lan-multiplayer` adds message framing and host-authoritative TypeScript game sessions.
 
 The MVP supports one advertised server, one discovery operation, multiple clients, create/join/leave flows, and generic game events. It is foreground-only and does not implement authentication, reconnection, host migration, or background hosting.
 
+The iOS app must declare `NSLocalNetworkUsageDescription` and list `_expo-lan-game._tcp` in `NSBonjourServices`. The example app includes both declarations in `app.json`.
+
 ## Prerequisites
 
-- macOS or Linux with the Android SDK installed.
-- Android SDK Platform 36, Build Tools 35 or newer, and Platform Tools.
-- Java 17 or newer.
-- Two Android emulators or USB-debuggable physical devices.
-- Both test devices on the same local network for NSD discovery.
+- Android: macOS or Linux with Android SDK Platform 36, Build Tools 35 or newer, Platform Tools, and Java 17 or newer.
+- Android: two emulators or USB-debuggable physical devices.
+- iOS: macOS with Xcode 26.4 or newer, Xcode Command Line Tools, and an iOS 16.4 or newer Simulator runtime.
+- Both physical test devices must be on the same local network for Bonjour/NSD discovery.
 
 This repository includes a Nix development shell for Node.js and the other project tools:
 
@@ -36,6 +38,15 @@ Confirm that Android targets are available:
 ```zsh
 adb devices -l
 ```
+
+On macOS, confirm that Xcode and at least one iOS Simulator are available:
+
+```zsh
+xcodebuild -version
+xcrun simctl list devices available
+```
+
+Install a Simulator runtime from **Xcode > Settings > Components** if the device list is empty.
 
 ## Initial Setup
 
@@ -66,6 +77,8 @@ cd expo-lan-sockets/@opengamesonline/expo-lan-sockets-example
 npm start
 ```
 
+### Android
+
 In a second terminal, build and install the development client on the first target:
 
 ```zsh
@@ -77,6 +90,40 @@ Select the first emulator or physical device when prompted. Run the same command
 
 `expo run:android` generates the ignored `android/` project when needed, installs the debug APK, and opens the running Metro URL in the development client.
 
+### iOS Simulator
+
+In a second terminal, build and install the development client on an iOS Simulator:
+
+```zsh
+cd expo-lan-sockets/@opengamesonline/expo-lan-sockets-example
+npm run ios -- --device --no-bundler
+```
+
+Select an available simulator when prompted. Expo generates the ignored `ios/` project when needed, installs CocoaPods dependencies, boots the selected simulator, builds the app, and opens the running Metro URL in the development client.
+
+For a two-simulator multiplayer test, run the same command again and select a different simulator. You can also open Simulator manually and choose additional devices from **File > Open Simulator**:
+
+```zsh
+open -a Simulator
+```
+
+After the development client has been installed, press **Shift + I** in Metro's terminal UI to select and reopen an iOS Simulator without rebuilding the native app.
+
+### Android Host to iOS Simulator Bridge
+
+The Android emulator uses NAT, so an iOS Simulator cannot connect to the emulator address advertised through Bonjour. For an emulator-only cross-platform test, replace `npm start` with the bridge command:
+
+```zsh
+cd expo-lan-sockets/@opengamesonline/expo-lan-sockets-example
+npm run bridge
+```
+
+The script starts Metro and an external sidecar that monitors every running `emulator-*` device from `adb devices`. Emulators can be started or stopped while the sidecar runs. When an emulator advertises a game, the sidecar probes its dynamic port through each AVD, keeps the matching ADB forward, starts a TCP relay on the Mac, and publishes a labeled Bonjour proxy. The application and native modules continue using their normal dynamic ports and Bonjour connection path.
+
+Leave the script running, create the game on any Android emulator, choose **Find games** on iOS, and join the service named `Game name [bridge emulator-5554]`. Do not select the original service because it still resolves through the emulator's unreachable NAT path. Press **Ctrl-C** to stop Metro and remove all proxy advertisements, relays, and ADB forwarding rules.
+
+Services hosted outside the connected Android emulators are ignored. The sidecar is development tooling only and requires no special native build. Use regular `npm start` when iOS is hosting or when testing physical devices.
+
 ## Development Loop
 
 Metro reads these directories directly through `metro.config.js`:
@@ -87,10 +134,11 @@ Metro reads these directories directly through `metro.config.js`:
 
 Changes in those TypeScript files use Fast Refresh and do not require rebuilding package output.
 
-After changing Kotlin, `AndroidManifest.xml`, native dependencies, or Expo app configuration, reinstall the native build on each target:
+After changing Kotlin, Swift, a native manifest, native dependencies, or Expo app configuration, reinstall the corresponding native build on each target:
 
 ```zsh
 npm run android:device -- --no-bundler
+npm run ios -- --device --no-bundler
 ```
 
 Run the local checks separately when changing public package APIs:
@@ -127,6 +175,6 @@ The Android suite exercises server restart, client connect and disconnect, bidir
 6. Press tiles from both devices and confirm that both boards update.
 7. Leave the game and confirm the player is removed.
 
-Physical devices on the same Wi-Fi network are recommended for NSD testing. Android emulators may not forward multicast DNS between emulator instances even when both apps and TCP transport work correctly.
+Physical devices on the same Wi-Fi network are recommended for final Bonjour/NSD testing. Android emulators may not forward multicast DNS between emulator instances even when both apps and TCP transport work correctly. Use the development bridge above when an Android emulator must host for an iOS Simulator.
 
 If a development client cannot connect, confirm Metro is listening on port `8081`, the host firewall allows local connections, and the device can reach the host machine's LAN address. Rerunning `npm run android:device -- --no-bundler` reopens the correct development URL.

@@ -7,7 +7,14 @@
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",
     "ios": {
-      "supportsTablet": true
+      "supportsTablet": true,
+      "infoPlist": {
+        "NSLocalNetworkUsageDescription": "Discover and connect to multiplayer games on your local network.",
+        "NSBonjourServices": [
+          "_expo-lan-game._tcp"
+        ]
+      },
+      "bundleIdentifier": "com.sudokuru.expolansocketsexample"
     },
     "android": {
       "adaptiveIcon": {

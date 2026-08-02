@@ -22,7 +22,10 @@ export class LanMultiplayer {
   private readonly subscriptions: Subscription[];
   private readonly hostId = randomId();
   private activeSession: GameSession<unknown, unknown> | null = null;
+  private pendingJoinSession: GameSession<unknown, unknown> | null = null;
+  private joinAttempt = 0;
   private discovering = false;
+  private stoppingDiscovery: Promise<void> | null = null;
 
   constructor() {
     this.subscriptions = [
@@ -73,18 +76,31 @@ export class LanMultiplayer {
   }
 
   async startDiscovery(): Promise<void> {
+    if (this.stoppingDiscovery) await this.stoppingDiscovery;
     if (this.discovering) return;
-    await ExpoLanSockets.startDiscoveryAsync(SERVICE_TYPE);
     this.discovering = true;
+    try {
+      await ExpoLanSockets.startDiscoveryAsync(SERVICE_TYPE);
+    } catch (error) {
+      this.discovering = false;
+      throw error;
+    }
   }
 
   async stopDiscovery(): Promise<void> {
+    if (this.stoppingDiscovery) return this.stoppingDiscovery;
     if (!this.discovering) return;
-    await ExpoLanSockets.stopDiscoveryAsync();
     this.discovering = false;
     this.games.clear();
     this.serviceHosts.clear();
     this.emitGames();
+    const operation = ExpoLanSockets.stopDiscoveryAsync();
+    this.stoppingDiscovery = operation;
+    try {
+      await operation;
+    } finally {
+      if (this.stoppingDiscovery === operation) this.stoppingDiscovery = null;
+    }
   }
 
   async createGame<State, GameEvent>(
@@ -109,19 +125,33 @@ export class LanMultiplayer {
     this.assertNoSession();
     const session = GameSession.client<State, GameEvent>(this, ExpoLanSockets);
     this.activeSession = session as GameSession<unknown, unknown>;
+    this.pendingJoinSession = session as GameSession<unknown, unknown>;
+    const attempt = ++this.joinAttempt;
     let connectionId: string | null = null;
     try {
       const hostId = this.serviceHosts.get(options.service.serviceId);
-      const connection = await this.connectToGame(options.service, hostId);
+      const connection = await this.connectToGame(options.service, hostId, attempt);
       connectionId = connection.connectionId;
-      if (this.discovering) await this.stopDiscovery();
+      this.assertJoinActive(attempt);
       await session.attachServer(connection.connectionId, options.playerName);
+      this.assertJoinActive(attempt);
+      if (this.discovering) void this.stopDiscovery().catch(() => undefined);
       return session;
     } catch (error) {
       if (connectionId) await ExpoLanSockets.disconnectAsync(connectionId);
-      this.activeSession = null;
+      if (this.activeSession === session) this.activeSession = null;
       throw error;
+    } finally {
+      if (this.pendingJoinSession === session) this.pendingJoinSession = null;
     }
+  }
+
+  cancelPendingJoin(): void {
+    const session = this.pendingJoinSession;
+    if (!session) return;
+    this.joinAttempt += 1;
+    this.pendingJoinSession = null;
+    if (this.activeSession === session) this.activeSession = null;
   }
 
   sessionEnded(session: GameSession<unknown, unknown>): void {
@@ -148,9 +178,10 @@ export class LanMultiplayer {
     this.gamesListeners.forEach((listener) => listener(games));
   }
 
-  private async connectToGame(service: DiscoveredService, hostId?: string) {
+  private async connectToGame(service: DiscoveredService, hostId: string | undefined, joinAttempt: number) {
     let lastError: unknown;
     for (let attempt = 0; attempt < CONNECT_ATTEMPTS; attempt += 1) {
+      this.assertJoinActive(joinAttempt);
       const currentService = hostId
         ? [...this.serviceHosts].find(([, candidateHostId]) => candidateHostId === hostId)?.[0]
         : service.serviceId;
@@ -162,6 +193,10 @@ export class LanMultiplayer {
       }
     }
     throw lastError;
+  }
+
+  private assertJoinActive(attempt: number): void {
+    if (attempt !== this.joinAttempt) throw new Error('Join cancelled');
   }
 }
 

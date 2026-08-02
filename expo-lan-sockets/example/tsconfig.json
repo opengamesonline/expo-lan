@@ -1,0 +1,10 @@
+{
+  "extends": "expo/tsconfig.base",
+  "compilerOptions": {
+    "strict": true,
+    "paths": {
+      "@opengamesonline/expo-lan-sockets": ["../src/index"],
+      "@opengamesonline/expo-lan-sockets/*": ["../src/*"]
+    }
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "platforms": ["apple", "android"],
+  "apple": {
+    "modules": ["ExpoLanSocketsModule"]
+  },
+  "android": {
+    "modules": ["com.opengamesonline.expolansockets.ExpoLanSocketsModule"]
+  }
+}

@@ -107,6 +107,16 @@ cd ../expo-lan-sockets/@opengamesonline/expo-lan-sockets-example
 npm run check
 ```
 
+The multiplayer tests use an injected in-memory socket transport and cover lobby creation and joining, host-only game start, client start notifications, authoritative tile synchronization, leaving, disconnects, late joins, and fragmented TCP frames.
+
+With at least one Android emulator or device connected, run the native loopback integration suite from the example app:
+
+```zsh
+npm run test:android:sockets
+```
+
+The Android suite exercises server restart, client connect and disconnect, bidirectional binary messages, broadcasts to multiple clients, repeated lifecycle cycles, full manager cleanup, and injected socket cleanup failures. It tests the JDK `ServerSocket` and `Socket` transport directly; NSD discovery remains a physical-device end-to-end concern.
+
 ## Testing Multiplayer
 
 1. Open the app on both targets.

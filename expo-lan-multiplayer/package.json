@@ -11,13 +11,14 @@
   "scripts": {
     "build": "tsc",
     "prepack": "npm run build",
-    "test": "npm run build && node --test test/*.test.cjs"
+    "test": "npm run build && tsx --test test/*.test.ts"
   },
   "peerDependencies": {
     "@opengamesonline/expo-lan-sockets": "^0.1.0"
   },
   "devDependencies": {
     "@opengamesonline/expo-lan-sockets": "file:../expo-lan-sockets",
+    "tsx": "^4.20.6",
     "typescript": "^5.9.2"
   },
   "license": "MIT"

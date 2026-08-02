@@ -9,37 +9,41 @@ import expo.modules.kotlin.modules.Module
 import expo.modules.kotlin.modules.ModuleDefinition
 import expo.modules.kotlin.records.Field
 import expo.modules.kotlin.records.Record
-import java.net.InetSocketAddress
-import java.net.InetAddress
-import java.net.ServerSocket
-import java.net.Socket
-import java.net.SocketException
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.Executors
-import java.util.concurrent.atomic.AtomicBoolean
-
-private const val MAX_CONNECTIONS = 8
-private const val CONNECT_TIMEOUT_MS = 10_000
 
 internal data class ServerOptions(
   @Field val serviceName: String = "Expo LAN Game",
   @Field val serviceType: String = "_expo-lan-game._tcp."
 ) : Record
 
-private class ManagedConnection(val id: String, val socket: Socket, val incoming: Boolean) {
-  val writeLock = Any()
-  val closed = AtomicBoolean(false)
-}
-
 class ExpoLanSocketsModule : Module() {
   private val stateLock = Any()
-  private val executor = Executors.newCachedThreadPool()
-  private val connections = ConcurrentHashMap<String, ManagedConnection>()
   private val discoveredServices = ConcurrentHashMap<String, NsdServiceInfo>()
   private val discoveredServiceIds = ConcurrentHashMap<String, String>()
+  private val tcpManager = TcpManager(object : TcpManagerListener {
+    override fun onConnectionOpened(info: TcpConnectionInfo) {
+      sendEvent("onConnectionOpened", connectionInfoMap(info))
+    }
 
-  private var serverSocket: ServerSocket? = null
+    override fun onMessage(connectionId: String, data: ByteArray) {
+      sendEvent("onMessage", mapOf("connectionId" to connectionId, "data" to data))
+    }
+
+    override fun onConnectionClosed(connectionId: String, reason: TcpCloseReason, message: String?) {
+      if (!destroyed) {
+        sendEvent(
+          "onConnectionClosed",
+          mapOf("connectionId" to connectionId, "reason" to reason.value, "message" to message)
+        )
+      }
+    }
+
+    override fun onServerError(code: String, message: String) {
+      emitError(code, message, "server")
+    }
+  })
+
   private var registrationListener: NsdManager.RegistrationListener? = null
   private var serverStopPromise: Promise? = null
   private var discoveryListener: NsdManager.DiscoveryListener? = null
@@ -72,7 +76,12 @@ class ExpoLanSocketsModule : Module() {
     }
 
     AsyncFunction("startServerAsync") { options: ServerOptions, promise: Promise ->
-      startServer(options, promise)
+      tcpManager.startServer { result ->
+        result.fold(
+          onSuccess = { server -> registerService(server, options, promise) },
+          onFailure = { error -> rejectTcp(promise, error) }
+        )
+      }
     }
 
     AsyncFunction("stopServerAsync") { promise: Promise ->
@@ -88,7 +97,7 @@ class ExpoLanSocketsModule : Module() {
     }
 
     AsyncFunction("connectAsync") { host: String, port: Int, promise: Promise ->
-      executor.execute { connect(host, port, promise) }
+      tcpManager.connect(host, port) { result -> settleConnection(promise, result) }
     }
 
     AsyncFunction("connectToServiceAsync") { serviceId: String, promise: Promise ->
@@ -96,62 +105,39 @@ class ExpoLanSocketsModule : Module() {
     }
 
     AsyncFunction("sendAsync") { connectionId: String, data: ByteArray ->
-      val connection = connections[connectionId]
-        ?: throw LanSocketsException("ERR_CONNECTION_NOT_FOUND", "Connection '$connectionId' was not found")
-      write(connection, data)
+      try {
+        tcpManager.send(connectionId, data)
+      } catch (error: TcpException) {
+        throw LanSocketsException(error.code, error.message ?: "Could not send data", error)
+      }
     }
 
     AsyncFunction("broadcastAsync") { data: ByteArray ->
-      connections.values.forEach { connection -> write(connection, data) }
+      try {
+        tcpManager.broadcast(data)
+      } catch (error: TcpException) {
+        throw LanSocketsException(error.code, error.message ?: "Could not broadcast data", error)
+      }
     }
 
     AsyncFunction("disconnectAsync") { connectionId: String ->
-      connections[connectionId]?.let { closeConnection(it, "local_close") }
+      tcpManager.disconnect(connectionId)
     }
 
     OnDestroy {
       destroyed = true
       stopDiscovery(null)
       stopServer(null)
-      executor.shutdownNow()
+      tcpManager.close()
     }
   }
 
-  private fun startServer(options: ServerOptions, promise: Promise) {
-    synchronized(stateLock) {
-      if (serverSocket != null) {
-        promise.reject("ERR_SERVER_ALREADY_RUNNING", "A server is already running", null)
-        return
-      }
-    }
-
-    executor.execute {
-      val server = try {
-        ServerSocket(0)
-      } catch (error: Exception) {
-        promise.reject("ERR_SERVER_START", error.message ?: "Could not start server", error)
-        return@execute
-      }
-
-      synchronized(stateLock) {
-        if (destroyed || serverSocket != null) {
-          server.close()
-          promise.reject("ERR_SERVER_START", "The server cannot be started", null)
-          return@execute
-        }
-        serverSocket = server
-      }
-      executor.execute { acceptConnections(server) }
-      registerService(server, options, promise)
-    }
-  }
-
-  private fun registerService(server: ServerSocket, options: ServerOptions, promise: Promise) {
+  private fun registerService(server: TcpServer, options: ServerOptions, promise: Promise) {
     val listener = object : NsdManager.RegistrationListener {
       override fun onServiceRegistered(serviceInfo: NsdServiceInfo) {
         promise.resolve(
           mapOf(
-            "port" to server.localPort,
+            "port" to server.port,
             "serviceName" to serviceInfo.serviceName,
             "serviceType" to options.serviceType
           )
@@ -161,7 +147,7 @@ class ExpoLanSocketsModule : Module() {
       override fun onRegistrationFailed(serviceInfo: NsdServiceInfo, errorCode: Int) {
         synchronized(stateLock) { registrationListener = null }
         releaseMulticast()
-        closeServerSocket(server)
+        tcpManager.stopServer(server)
         promise.reject("ERR_SERVICE_REGISTRATION", "NSD registration failed ($errorCode)", null)
       }
 
@@ -195,7 +181,7 @@ class ExpoLanSocketsModule : Module() {
     val serviceInfo = NsdServiceInfo().apply {
       serviceName = options.serviceName
       serviceType = options.serviceType
-      port = server.localPort
+      port = server.port
     }
 
     try {
@@ -203,27 +189,18 @@ class ExpoLanSocketsModule : Module() {
     } catch (error: Exception) {
       synchronized(stateLock) { registrationListener = null }
       releaseMulticast()
-      closeServerSocket(server)
+      tcpManager.stopServer(server)
       promise.reject("ERR_SERVICE_REGISTRATION", error.message ?: "Could not register service", error)
     }
   }
 
   private fun stopServer(promise: Promise?) {
-    val listener: NsdManager.RegistrationListener?
-    val server: ServerSocket?
-    synchronized(stateLock) {
-      listener = registrationListener
+    val listener = synchronized(stateLock) {
+      val current = registrationListener
       registrationListener = null
-      server = serverSocket
-      serverSocket = null
+      current
     }
-
-    try {
-      server?.close()
-    } catch (_: Exception) {
-      // Closing an already closed listener is harmless.
-    }
-    connections.values.filter { it.incoming }.forEach { closeConnection(it, "server_stopped") }
+    tcpManager.stopServer()
 
     if (listener == null) {
       promise?.resolve()
@@ -237,24 +214,6 @@ class ExpoLanSocketsModule : Module() {
       synchronized(stateLock) { serverStopPromise = null }
       releaseMulticast()
       promise?.reject("ERR_SERVICE_UNREGISTRATION", error.message ?: "Could not unregister service", error)
-    }
-  }
-
-  private fun acceptConnections(server: ServerSocket) {
-    while (!server.isClosed) {
-      try {
-        val socket = server.accept()
-        if (connections.size >= MAX_CONNECTIONS) {
-          socket.close()
-          continue
-        }
-        addConnection(socket, true)
-      } catch (error: SocketException) {
-        if (!server.isClosed) emitError("ERR_SERVER_ACCEPT", error.message ?: "Accept failed", "server")
-        return
-      } catch (error: Exception) {
-        if (!server.isClosed) emitError("ERR_SERVER_ACCEPT", error.message ?: "Accept failed", "server")
-      }
     }
   }
 
@@ -354,7 +313,7 @@ class ExpoLanSocketsModule : Module() {
             promise.reject("ERR_SERVICE_RESOLVE", "The service has no reachable address", null)
             return
           }
-          executor.execute { connect(address, serviceInfo.port, promise) }
+          tcpManager.connect(address, serviceInfo.port) { result -> settleConnection(promise, result) }
         }
 
         override fun onResolveFailed(serviceInfo: NsdServiceInfo, errorCode: Int) {
@@ -366,111 +325,26 @@ class ExpoLanSocketsModule : Module() {
     }
   }
 
-  private fun connect(host: String, port: Int, promise: Promise) {
-    val address = try {
-      InetAddress.getByName(host)
-    } catch (error: Exception) {
-      promise.reject("ERR_CONNECTION_FAILED", error.message ?: "Could not resolve host", error)
-      return
-    }
-    connect(address, port, promise)
+  private fun settleConnection(promise: Promise, result: Result<TcpConnectionInfo>) {
+    result.fold(
+      onSuccess = { info -> promise.resolve(connectionInfoMap(info)) },
+      onFailure = { error -> rejectTcp(promise, error) }
+    )
   }
 
-  private fun connect(address: InetAddress, port: Int, promise: Promise) {
-    if (port !in 1..65535) {
-      promise.reject("ERR_INVALID_PORT", "Port must be between 1 and 65535", null)
-      return
-    }
-    val socket = Socket()
-    try {
-      socket.connect(InetSocketAddress(address, port), CONNECT_TIMEOUT_MS)
-      val connection = addConnection(socket, false)
-      promise.resolve(connectionInfo(connection))
-    } catch (error: Exception) {
-      try {
-        socket.close()
-      } catch (_: Exception) {
-        // Ignore cleanup errors after a failed connection.
-      }
-      promise.reject("ERR_CONNECTION_FAILED", error.message ?: "Could not connect", error)
+  private fun rejectTcp(promise: Promise, error: Throwable) {
+    if (error is TcpException) {
+      promise.reject(error.code, error.message, error.cause)
+    } else {
+      promise.reject("ERR_CONNECTION_FAILED", error.message ?: "TCP operation failed", error)
     }
   }
 
-  private fun addConnection(socket: Socket, incoming: Boolean): ManagedConnection {
-    socket.tcpNoDelay = true
-    val connection = ManagedConnection(UUID.randomUUID().toString(), socket, incoming)
-    connections[connection.id] = connection
-    sendEvent("onConnectionOpened", connectionInfo(connection))
-    executor.execute { readConnection(connection) }
-    return connection
-  }
-
-  private fun readConnection(connection: ManagedConnection) {
-    val buffer = ByteArray(8 * 1024)
-    try {
-      val input = connection.socket.getInputStream()
-      while (!connection.closed.get()) {
-        val count = input.read(buffer)
-        if (count < 0) break
-        if (count > 0) {
-          sendEvent(
-            "onMessage",
-            mapOf("connectionId" to connection.id, "data" to buffer.copyOf(count))
-          )
-        }
-      }
-      closeConnection(connection, "remote_close")
-    } catch (error: Exception) {
-      if (!connection.closed.get()) closeConnection(connection, "connection_error", error.message)
-    }
-  }
-
-  private fun write(connection: ManagedConnection, data: ByteArray) {
-    try {
-      synchronized(connection.writeLock) {
-        connection.socket.getOutputStream().apply {
-          write(data)
-          flush()
-        }
-      }
-    } catch (error: Exception) {
-      closeConnection(connection, "connection_error", error.message)
-      throw LanSocketsException("ERR_SEND_FAILED", error.message ?: "Could not send data", error)
-    }
-  }
-
-  private fun closeConnection(connection: ManagedConnection, reason: String, message: String? = null) {
-    if (!connection.closed.compareAndSet(false, true)) return
-    connections.remove(connection.id)
-    try {
-      connection.socket.close()
-    } catch (_: Exception) {
-      // The close event is still valid if the underlying socket was already closed.
-    }
-    if (!destroyed) {
-      sendEvent(
-        "onConnectionClosed",
-        mapOf("connectionId" to connection.id, "reason" to reason, "message" to message)
-      )
-    }
-  }
-
-  private fun closeServerSocket(server: ServerSocket) {
-    synchronized(stateLock) {
-      if (serverSocket === server) serverSocket = null
-    }
-    try {
-      server.close()
-    } catch (_: Exception) {
-      // Ignore cleanup errors while unwinding startup.
-    }
-  }
-
-  private fun connectionInfo(connection: ManagedConnection): Map<String, Any?> = mapOf(
-    "connectionId" to connection.id,
-    "remoteAddress" to connection.socket.inetAddress?.hostAddress,
-    "remotePort" to connection.socket.port,
-    "incoming" to connection.incoming
+  private fun connectionInfoMap(info: TcpConnectionInfo): Map<String, Any?> = mapOf(
+    "connectionId" to info.connectionId,
+    "remoteAddress" to info.remoteAddress,
+    "remotePort" to info.remotePort,
+    "incoming" to info.incoming
   )
 
   private fun serviceKey(serviceInfo: NsdServiceInfo) =

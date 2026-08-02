@@ -245,22 +245,31 @@ function Lobby(props: {
   onLeave(): void;
 }) {
   const isHost = props.snapshot.role === 'host';
+  const isClosed = props.snapshot.status === 'disconnected';
   return (
     <View style={styles.card}>
       <Text style={styles.eyebrow}>GAME LOBBY</Text>
-      <Text style={styles.title}>{isHost ? 'Ready when you are.' : 'Waiting for the host.'}</Text>
+      <Text style={styles.title}>
+        {isClosed ? 'Lobby closed.' : isHost ? 'Ready when you are.' : 'Waiting for the host.'}
+      </Text>
       <Text style={styles.body}>
-        {isHost
+        {isClosed
+          ? 'The connection to the host ended. Return home to create or find another game.'
+          : isHost
           ? 'Players can join while this lobby is open. Start the game when everyone is here.'
           : 'You are connected. The board will open when the host starts the game.'}
       </Text>
       <PlayerList snapshot={props.snapshot} />
-      {isHost ? (
+      {isClosed ? null : isHost ? (
         <ActionButton label="Start game" primary disabled={props.busy} onPress={props.onStart} />
       ) : (
         <View style={styles.waiting}><ActivityIndicator color="#36C5A3" /><Text style={styles.emptyText}>Host controls the start</Text></View>
       )}
-      <ActionButton label={isHost ? 'Close lobby' : 'Leave lobby'} disabled={props.busy} onPress={props.onLeave} />
+      <ActionButton
+        label={isClosed ? 'Back to home' : isHost ? 'Close lobby' : 'Leave lobby'}
+        disabled={props.busy}
+        onPress={props.onLeave}
+      />
     </View>
   );
 }

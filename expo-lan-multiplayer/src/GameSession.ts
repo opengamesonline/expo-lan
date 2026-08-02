@@ -1,6 +1,5 @@
-import ExpoLanSockets from '@opengamesonline/expo-lan-sockets';
-
 import { encodeMessage, MessageDecoder, PROTOCOL_VERSION, type WireMessage } from './protocol';
+import type { SessionTransport } from './SessionTransport';
 import type {
   CreateGameOptions,
   GamePhase,
@@ -31,6 +30,7 @@ export class GameSession<State, GameEvent> {
 
   private constructor(
     private readonly owner: SessionOwner,
+    private readonly transport: SessionTransport,
     readonly role: SessionRole,
     state: State | null,
     private readonly hostOptions?: CreateGameOptions<State, GameEvent>
@@ -43,13 +43,17 @@ export class GameSession<State, GameEvent> {
 
   static host<State, GameEvent>(
     owner: SessionOwner,
+    transport: SessionTransport,
     options: CreateGameOptions<State, GameEvent>
   ): GameSession<State, GameEvent> {
-    return new GameSession(owner, 'host', options.initialState, options);
+    return new GameSession(owner, transport, 'host', options.initialState, options);
   }
 
-  static client<State, GameEvent>(owner: SessionOwner): GameSession<State, GameEvent> {
-    return new GameSession<State, GameEvent>(owner, 'client', null);
+  static client<State, GameEvent>(
+    owner: SessionOwner,
+    transport: SessionTransport
+  ): GameSession<State, GameEvent> {
+    return new GameSession<State, GameEvent>(owner, transport, 'client', null);
   }
 
   get snapshot(): SessionSnapshot<State> {
@@ -98,16 +102,17 @@ export class GameSession<State, GameEvent> {
 
   async leaveGame(): Promise<void> {
     if (this.status === 'left') return;
+    const wasDisconnected = this.status === 'disconnected';
     this.status = 'left';
     this.emit();
     try {
       if (this.role === 'host') {
-        await ExpoLanSockets.stopServerAsync();
-      } else if (this.connectionId) {
+        await this.transport.stopServerAsync();
+      } else if (this.connectionId && !wasDisconnected) {
         try {
           await this.sendToServer({ v: PROTOCOL_VERSION, kind: 'leave' });
         } finally {
-          await ExpoLanSockets.disconnectAsync(this.connectionId);
+          await this.transport.disconnectAsync(this.connectionId);
         }
       }
     } finally {
@@ -133,7 +138,7 @@ export class GameSession<State, GameEvent> {
       for (const message of decoder.push(data)) void this.handleMessage(connectionId, message);
     } catch (cause) {
       this.fail(cause instanceof Error ? cause.message : 'Invalid LAN message');
-      void ExpoLanSockets.disconnectAsync(connectionId);
+      void this.transport.disconnectAsync(connectionId);
     }
   }
 
@@ -142,6 +147,7 @@ export class GameSession<State, GameEvent> {
     if (this.role === 'client' && connectionId === this.connectionId && this.status !== 'left') {
       this.status = 'disconnected';
       this.error = 'The host disconnected';
+      this.players = this.self ? [this.self] : [];
       this.emit();
       return;
     }
@@ -177,7 +183,7 @@ export class GameSession<State, GameEvent> {
     if (message.kind === 'gameEvent') await this.applyEvent(message.event, player);
     if (message.kind === 'leave') {
       await this.removePlayer(connectionId);
-      await ExpoLanSockets.disconnectAsync(connectionId);
+      await this.transport.disconnectAsync(connectionId);
     }
   }
 
@@ -216,13 +222,13 @@ export class GameSession<State, GameEvent> {
     if (this.state === null) throw new Error('The host state is not ready');
     if (this.phase === 'started') {
       await this.send(connectionId, { v: PROTOCOL_VERSION, kind: 'rejected', reason: 'The game has already started' });
-      await ExpoLanSockets.disconnectAsync(connectionId);
+      await this.transport.disconnectAsync(connectionId);
       return;
     }
     const maxPlayers = this.hostOptions?.maxPlayers ?? 8;
     if (this.players.length >= maxPlayers) {
       await this.send(connectionId, { v: PROTOCOL_VERSION, kind: 'rejected', reason: 'The game is full' });
-      await ExpoLanSockets.disconnectAsync(connectionId);
+      await this.transport.disconnectAsync(connectionId);
       return;
     }
 
@@ -270,7 +276,7 @@ export class GameSession<State, GameEvent> {
   }
 
   private async send(connectionId: string, message: WireMessage<State, GameEvent>): Promise<void> {
-    await ExpoLanSockets.sendAsync(connectionId, encodeMessage(message));
+    await this.transport.sendAsync(connectionId, encodeMessage(message));
   }
 
   private async broadcast(
@@ -280,7 +286,7 @@ export class GameSession<State, GameEvent> {
     const data = encodeMessage(message);
     const sends = [...this.playerConnections.values()]
       .filter((connectionId) => connectionId !== excludedConnectionId)
-      .map((connectionId) => ExpoLanSockets.sendAsync(connectionId, data));
+      .map((connectionId) => this.transport.sendAsync(connectionId, data));
     await Promise.all(sends);
   }
 

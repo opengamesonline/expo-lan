@@ -20,6 +20,7 @@
     "android": "expo run:android",
     "android:device": "expo run:android --device",
     "check": "tsc --noEmit",
+    "test:android:sockets": "android/gradlew -p android :opengamesonline-expo-lan-sockets:connectedDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.class=com.opengamesonline.expolansockets.TcpManagerInstrumentedTest",
     "ios": "expo run:ios",
     "web": "expo start --web"
   },

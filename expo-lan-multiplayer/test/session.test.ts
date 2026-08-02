@@ -1,0 +1,184 @@
+import assert from 'node:assert/strict';
+import test from 'node:test';
+
+import { GameSession } from '../src/GameSession';
+import type { SessionTransport } from '../src/SessionTransport';
+
+type TileState = { tiles: Array<number | null> };
+type TileEvent = { type: 'claimTile'; tile: number };
+type TestSession = GameSession<TileState, TileEvent>;
+
+class SessionOwner {
+  ended = 0;
+
+  sessionEnded(_session: GameSession<unknown, unknown>): void {
+    this.ended += 1;
+  }
+}
+
+type Link = {
+  client: TestSession;
+  clientConnectionId: string;
+};
+
+class HostTransport implements SessionTransport {
+  host!: TestSession;
+  readonly links = new Map<string, Link>();
+
+  async sendAsync(connectionId: string, data: Uint8Array): Promise<void> {
+    const link = this.links.get(connectionId);
+    if (!link) throw new Error(`Unknown host connection ${connectionId}`);
+    link.client.receive(link.clientConnectionId, data.slice());
+    await settle();
+  }
+
+  async disconnectAsync(connectionId: string): Promise<void> {
+    this.disconnect(connectionId);
+  }
+
+  async stopServerAsync(): Promise<void> {
+    [...this.links.keys()].forEach((connectionId) => this.disconnect(connectionId));
+  }
+
+  disconnect(connectionId: string): void {
+    const link = this.links.get(connectionId);
+    if (!link) return;
+    this.links.delete(connectionId);
+    this.host.disconnected(connectionId);
+    link.client.disconnected(link.clientConnectionId);
+  }
+}
+
+class ClientTransport implements SessionTransport {
+  client!: TestSession;
+
+  constructor(
+    private readonly hostTransport: HostTransport,
+    private readonly hostConnectionId: string,
+    private readonly clientConnectionId: string
+  ) {}
+
+  async sendAsync(connectionId: string, data: Uint8Array): Promise<void> {
+    assert.equal(connectionId, this.clientConnectionId);
+    this.hostTransport.host.receive(this.hostConnectionId, data.slice());
+    await settle();
+  }
+
+  async disconnectAsync(connectionId: string): Promise<void> {
+    assert.equal(connectionId, this.clientConnectionId);
+    this.hostTransport.disconnect(this.hostConnectionId);
+  }
+
+  async stopServerAsync(): Promise<void> {
+    throw new Error('A client cannot stop the server');
+  }
+}
+
+function createHost() {
+  const owner = new SessionOwner();
+  const transport = new HostTransport();
+  const session = GameSession.host<TileState, TileEvent>(owner, transport, {
+    name: 'Test game',
+    playerName: 'Host',
+    initialState: { tiles: Array<number | null>(9).fill(null) },
+    reduceEvent(state, event, player) {
+      const tiles = [...state.tiles];
+      if (event.type === 'claimTile' && event.tile >= 0 && event.tile < tiles.length) {
+        tiles[event.tile] = player.slot;
+      }
+      return { tiles };
+    },
+  });
+  transport.host = session;
+  return { owner, session, transport };
+}
+
+async function joinClient(host: ReturnType<typeof createHost>, index = 1) {
+  const owner = new SessionOwner();
+  const hostConnectionId = `host-${index}`;
+  const clientConnectionId = `client-${index}`;
+  const transport = new ClientTransport(host.transport, hostConnectionId, clientConnectionId);
+  const session = GameSession.client<TileState, TileEvent>(owner, transport);
+  transport.client = session;
+  host.transport.links.set(hostConnectionId, { client: session, clientConnectionId });
+  host.session.attachIncoming(hostConnectionId);
+  await session.attachServer(clientConnectionId, `Client ${index}`);
+  await settle();
+  return { owner, session, transport };
+}
+
+test('creates a lobby and joins a client', async () => {
+  const host = createHost();
+  const client = await joinClient(host);
+
+  assert.equal(host.session.snapshot.phase, 'lobby');
+  assert.equal(client.session.snapshot.phase, 'lobby');
+  assert.equal(client.session.snapshot.status, 'connected');
+  assert.deepEqual(host.session.snapshot.players.map((player) => player.name), ['Host', 'Client 1']);
+  assert.deepEqual(client.session.snapshot.players.map((player) => player.name), ['Host', 'Client 1']);
+});
+
+test('only the host can start and clients receive the transition', async () => {
+  const host = createHost();
+  const client = await joinClient(host);
+
+  await assert.rejects(client.session.startGame(), /Only the host/);
+  await host.session.startGame();
+  await settle();
+
+  assert.equal(host.session.snapshot.phase, 'started');
+  assert.equal(client.session.snapshot.phase, 'started');
+});
+
+test('synchronizes an authoritative tile update', async () => {
+  const host = createHost();
+  const client = await joinClient(host);
+  await host.session.startGame();
+
+  await client.session.sendGameEvent({ type: 'claimTile', tile: 4 });
+  await settle();
+
+  const clientSlot = client.session.snapshot.self?.slot;
+  assert.equal(host.session.snapshot.state?.tiles[4], clientSlot);
+  assert.equal(client.session.snapshot.state?.tiles[4], clientSlot);
+  assert.equal(host.session.snapshot.revision, 1);
+  assert.equal(client.session.snapshot.revision, 1);
+});
+
+test('removes a client that leaves the lobby', async () => {
+  const host = createHost();
+  const client = await joinClient(host);
+
+  await client.session.leaveGame();
+  await settle();
+
+  assert.deepEqual(host.session.snapshot.players.map((player) => player.name), ['Host']);
+  assert.equal(client.session.snapshot.status, 'left');
+  assert.equal(client.owner.ended, 1);
+});
+
+test('notifies a client when the host closes the lobby', async () => {
+  const host = createHost();
+  const client = await joinClient(host);
+
+  await host.session.leaveGame();
+  await settle();
+
+  assert.equal(client.session.snapshot.status, 'disconnected');
+  assert.deepEqual(client.session.snapshot.players.map((player) => player.name), ['Client 1']);
+  assert.equal(host.owner.ended, 1);
+});
+
+test('rejects a late join after the game starts', async () => {
+  const host = createHost();
+  await host.session.startGame();
+  const client = await joinClient(host);
+
+  assert.equal(client.session.snapshot.status, 'disconnected');
+  assert.deepEqual(host.session.snapshot.players.map((player) => player.name), ['Host']);
+});
+
+async function settle(): Promise<void> {
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  await new Promise<void>((resolve) => setImmediate(resolve));
+}

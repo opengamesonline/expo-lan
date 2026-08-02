@@ -1,7 +1,7 @@
-const test = require('node:test');
-const assert = require('node:assert/strict');
+import assert from 'node:assert/strict';
+import test from 'node:test';
 
-const { MessageDecoder, encodeMessage } = require('../build/protocol');
+import { MAX_FRAME_BYTES, MessageDecoder, encodeMessage } from '../src/protocol';
 
 test('decodes a message split across TCP reads', () => {
   const encoded = encodeMessage({ v: 1, kind: 'leave' });
@@ -20,4 +20,14 @@ test('decodes multiple messages from one TCP read', () => {
     { v: 1, kind: 'leave' },
     { v: 1, kind: 'playerLeft', playerId: 'p1' },
   ]);
+});
+
+test('rejects unsupported protocol versions', () => {
+  const data = new TextEncoder().encode('{"v":2,"kind":"leave"}\n');
+  assert.throws(() => new MessageDecoder().push(data), /Unsupported LAN protocol/);
+});
+
+test('rejects oversized frames', () => {
+  const data = new Uint8Array(MAX_FRAME_BYTES + 1).fill(97);
+  assert.throws(() => new MessageDecoder().push(data), /exceeds/);
 });

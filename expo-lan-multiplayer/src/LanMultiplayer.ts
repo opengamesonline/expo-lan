@@ -6,10 +6,21 @@ import ExpoLanSockets, {
 } from '@opengamesonline/expo-lan-sockets';
 
 import { GameSession } from './GameSession';
-import { SERVICE_TYPE } from './protocol';
+import {
+  encodeMessage,
+  MessageDecoder,
+  PROTOCOL_VERSION,
+  SERVICE_TYPE,
+  WATCH_ACK_TIMEOUT_MS,
+} from './protocol';
 import type { CreateGameOptions, GamesListener, JoinGameOptions } from './types';
 
 type Subscription = { remove(): void };
+type GameWatch = {
+  connectionId: string;
+  decoder: MessageDecoder<unknown, unknown>;
+  timeout: ReturnType<typeof setTimeout>;
+};
 
 const SERVICE_ID_LENGTH = 6;
 const CONNECT_ATTEMPTS = 3;
@@ -19,6 +30,9 @@ export class LanMultiplayer {
   private readonly games = new Map<string, DiscoveredService>();
   private readonly serviceHosts = new Map<string, string>();
   private readonly gamesListeners = new Set<GamesListener>();
+  private readonly gameWatches = new Map<string, GameWatch>();
+  private readonly watchConnections = new Map<string, string>();
+  private readonly pendingWatches = new Set<string>();
   private readonly subscriptions: Subscription[];
   private readonly hostId = randomId();
   private activeSession: GameSession<unknown, unknown> | null = null;
@@ -26,37 +40,40 @@ export class LanMultiplayer {
   private joinAttempt = 0;
   private discovering = false;
   private stoppingDiscovery: Promise<void> | null = null;
+  private watchGeneration = 0;
 
   constructor() {
     this.subscriptions = [
       ExpoLanSockets.addListener('onServiceFound', (service) => {
         const advertised = parseAdvertisedName(service.name);
+        let game: DiscoveredService;
         if (advertised) {
           for (const [serviceId, hostId] of this.serviceHosts) {
             if (hostId === advertised.hostId && serviceId !== service.serviceId) {
-              this.games.delete(serviceId);
-              this.serviceHosts.delete(serviceId);
+              this.removeGame(serviceId);
             }
           }
           this.serviceHosts.set(service.serviceId, advertised.hostId);
-          this.games.set(service.serviceId, { ...service, name: advertised.name });
+          game = { ...service, name: advertised.name };
         } else {
-          this.games.set(service.serviceId, service);
+          game = service;
         }
+        this.games.set(service.serviceId, game);
         this.emitGames();
+        if (this.discovering) void this.startWatchingGame(service);
       }),
       ExpoLanSockets.addListener('onServiceLost', ({ serviceId }) => {
-        this.games.delete(serviceId);
-        this.serviceHosts.delete(serviceId);
-        this.emitGames();
+        if (this.removeGame(serviceId)) this.emitGames();
       }),
       ExpoLanSockets.addListener('onConnectionOpened', (connection) => {
         if (connection.incoming) this.activeSession?.attachIncoming(connection.connectionId);
       }),
       ExpoLanSockets.addListener('onMessage', (event: MessageEvent) => {
+        if (this.receiveWatchMessage(event)) return;
         this.activeSession?.receive(event.connectionId, event.data);
       }),
       ExpoLanSockets.addListener('onConnectionClosed', (event: ConnectionClosedEvent) => {
+        if (this.watchClosed(event.connectionId)) return;
         this.activeSession?.disconnected(event.connectionId);
       }),
       ExpoLanSockets.addListener('onError', (event: LanSocketsErrorEvent) => {
@@ -91,16 +108,25 @@ export class LanMultiplayer {
     if (this.stoppingDiscovery) return this.stoppingDiscovery;
     if (!this.discovering) return;
     this.discovering = false;
+    this.watchGeneration += 1;
     this.games.clear();
     this.serviceHosts.clear();
     this.emitGames();
-    const operation = ExpoLanSockets.stopDiscoveryAsync();
+    const operation = Promise.all([
+      ExpoLanSockets.stopDiscoveryAsync(),
+      this.stopAllWatches(),
+    ]).then(() => undefined);
     this.stoppingDiscovery = operation;
     try {
       await operation;
     } finally {
       if (this.stoppingDiscovery === operation) this.stoppingDiscovery = null;
     }
+  }
+
+  async refreshDiscovery(): Promise<void> {
+    await this.stopDiscovery();
+    await this.startDiscovery();
   }
 
   async createGame<State, GameEvent>(
@@ -176,6 +202,123 @@ export class LanMultiplayer {
   private emitGames(): void {
     const games = this.gameList();
     this.gamesListeners.forEach((listener) => listener(games));
+  }
+
+  private async startWatchingGame(service: DiscoveredService): Promise<void> {
+    const generation = this.watchGeneration;
+    const pendingKey = `${generation}:${service.serviceId}`;
+    if (
+      this.activeSession ||
+      this.gameWatches.has(service.serviceId) ||
+      this.pendingWatches.has(pendingKey)
+    ) {
+      return;
+    }
+    this.pendingWatches.add(pendingKey);
+    let connectionId: string | null = null;
+    try {
+      const connection = await ExpoLanSockets.connectToServiceAsync(service.serviceId);
+      connectionId = connection.connectionId;
+      if (
+        !this.discovering ||
+        generation !== this.watchGeneration ||
+        !this.games.has(service.serviceId) ||
+        this.activeSession
+      ) {
+        await ExpoLanSockets.disconnectAsync(connection.connectionId);
+        return;
+      }
+
+      const watch: GameWatch = {
+        connectionId: connection.connectionId,
+        decoder: new MessageDecoder(),
+        timeout: setTimeout(() => {
+          this.removeUnavailableGame(service.serviceId);
+        }, WATCH_ACK_TIMEOUT_MS),
+      };
+      this.gameWatches.set(service.serviceId, watch);
+      this.watchConnections.set(connection.connectionId, service.serviceId);
+      await ExpoLanSockets.sendAsync(
+        connection.connectionId,
+        encodeMessage({ v: PROTOCOL_VERSION, kind: 'watch' })
+      );
+    } catch {
+      if (connectionId) await ExpoLanSockets.disconnectAsync(connectionId).catch(() => undefined);
+      if (
+        this.discovering &&
+        generation === this.watchGeneration &&
+        this.games.has(service.serviceId)
+      ) {
+        this.removeUnavailableGame(service.serviceId);
+      }
+    } finally {
+      this.pendingWatches.delete(pendingKey);
+    }
+  }
+
+  private receiveWatchMessage(event: MessageEvent): boolean {
+    const serviceId = this.watchConnections.get(event.connectionId);
+    if (!serviceId) return false;
+    const watch = this.gameWatches.get(serviceId);
+    if (!watch || watch.connectionId !== event.connectionId) return true;
+    try {
+      for (const message of watch.decoder.push(event.data)) {
+        if (message.kind !== 'watching') continue;
+        if (message.phase !== 'lobby') {
+          this.removeUnavailableGame(serviceId);
+          return true;
+        }
+        clearTimeout(watch.timeout);
+      }
+    } catch {
+      this.removeUnavailableGame(serviceId);
+    }
+    return true;
+  }
+
+  private watchClosed(connectionId: string): boolean {
+    const serviceId = this.watchConnections.get(connectionId);
+    if (!serviceId) return false;
+    const watch = this.gameWatches.get(serviceId);
+    if (watch?.connectionId === connectionId) {
+      clearTimeout(watch.timeout);
+      this.gameWatches.delete(serviceId);
+    }
+    this.watchConnections.delete(connectionId);
+    if (this.discovering && this.games.delete(serviceId)) {
+      this.serviceHosts.delete(serviceId);
+      this.emitGames();
+    }
+    return true;
+  }
+
+  private removeGame(serviceId: string): boolean {
+    const removed = this.games.delete(serviceId);
+    this.serviceHosts.delete(serviceId);
+    const watch = this.gameWatches.get(serviceId);
+    if (watch) {
+      clearTimeout(watch.timeout);
+      this.gameWatches.delete(serviceId);
+      this.watchConnections.delete(watch.connectionId);
+      void ExpoLanSockets.disconnectAsync(watch.connectionId).catch(() => undefined);
+    }
+    return removed;
+  }
+
+  private removeUnavailableGame(serviceId: string): void {
+    if (this.removeGame(serviceId)) this.emitGames();
+  }
+
+  private async stopAllWatches(): Promise<void> {
+    const connectionIds = [...this.gameWatches.values()].map((watch) => {
+      clearTimeout(watch.timeout);
+      return watch.connectionId;
+    });
+    this.gameWatches.clear();
+    this.watchConnections.clear();
+    await Promise.allSettled(
+      connectionIds.map((connectionId) => ExpoLanSockets.disconnectAsync(connectionId))
+    );
   }
 
   private async connectToGame(service: DiscoveredService, hostId: string | undefined, joinAttempt: number) {

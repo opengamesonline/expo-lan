@@ -42,9 +42,38 @@ function parseEmulatorDevices(output) {
     .sort();
 }
 
+function parseIpv4Addresses(output) {
+  return [...output.matchAll(/\binet\s+(\d+(?:\.\d+){3})\//g)].map((match) => match[1]);
+}
+
+function matchingEmulator(service, devices) {
+  for (const address of service.addresses || []) {
+    const matches = devices.filter((device) => device.addresses.includes(address));
+    if (matches.length === 1) return matches[0];
+  }
+  return undefined;
+}
+
 async function listEmulatorDevices() {
   const { stdout } = await execFileAsync('adb', ['devices']);
-  return parseEmulatorDevices(stdout);
+  const serials = parseEmulatorDevices(stdout);
+  return Promise.all(
+    serials.map(async (serial) => {
+      const { stdout: addresses } = await execFileAsync('adb', [
+        '-s',
+        serial,
+        'shell',
+        'ip',
+        '-o',
+        '-4',
+        'addr',
+        'show',
+        'scope',
+        'global',
+      ]);
+      return { serial, addresses: parseIpv4Addresses(addresses) };
+    })
+  );
 }
 
 async function createAdbForward(device, remotePort) {
@@ -136,59 +165,73 @@ async function startBridge(bonjour, service) {
   const key = bridgeKey(service);
   if (stopping || bridges.has(key) || pendingServices.has(key)) return;
   pendingServices.add(key);
-  const devicesToProbe = [...emulatorDevices];
+  const devicesAtStart = [...emulatorDevices];
 
   try {
-    for (const device of devicesToProbe) {
-      if (stopping) return;
-      let adbPort;
-      let relay;
-      let sockets;
-      let activated = false;
-      try {
-        adbPort = await createAdbForward(device, service.port);
-        if (!(await canConnect(adbPort))) continue;
-        if (stopping || !sourceServices.has(key) || !emulatorDevices.includes(device)) return;
+    const device = matchingEmulator(service, devicesAtStart);
+    if (!device) {
+      const addresses = service.addresses?.join(', ') || 'unresolved';
+      console.log(`No emulator address matches ${service.name} at ${addresses}`);
+      return;
+    }
 
-        ({ relay, sockets } = createRelay(adbPort, service));
-        await listen(relay);
-        const relayAddress = relay.address();
-        if (!relayAddress || typeof relayAddress === 'string') {
-          throw new Error('TCP relay has no port');
-        }
-        const publication = bonjour.publish({
-          host: BRIDGE_HOST,
-          name: bridgedServiceName(service.name, device),
-          type: SERVICE_TYPE,
-          protocol: 'tcp',
-          port: relayAddress.port,
-        });
-        publication.on('error', (error) => {
-          console.error(`Could not advertise bridge for ${service.name}: ${error.message}`);
-        });
-
-        bridges.set(key, { adbPort, device, publication, relay, service, sockets });
-        activated = true;
+    let adbPort;
+    let relay;
+    let sockets;
+    let activated = false;
+    try {
+      adbPort = await createAdbForward(device.serial, service.port);
+      if (!(await canConnect(adbPort))) {
         console.log(
-          `Bridged ${service.name}: Mac:${relayAddress.port} -> ${device}:${service.port}`
+          `${service.name} is not accepting connections on ${device.serial}:${service.port}`
         );
         return;
-      } catch (error) {
-        console.error(`Could not probe ${service.name} on ${device}: ${error.message}`);
-      } finally {
-        if (!activated) {
-          sockets?.forEach((socket) => socket.destroy());
-          if (relay?.listening) await closeServer(relay);
-          if (adbPort) await removeAdbForward(device, adbPort);
-        }
       }
-    }
-    if (devicesToProbe.length > 0) {
-      console.log(`No running emulator accepted ${service.name} on port ${service.port}`);
+      if (
+        stopping ||
+        !sourceServices.has(key) ||
+        !emulatorDevices.some((candidate) => candidate.serial === device.serial)
+      ) {
+        return;
+      }
+
+      ({ relay, sockets } = createRelay(adbPort, service));
+      await listen(relay);
+      const relayAddress = relay.address();
+      if (!relayAddress || typeof relayAddress === 'string') {
+        throw new Error('TCP relay has no port');
+      }
+      const publication = bonjour.publish({
+        host: BRIDGE_HOST,
+        name: bridgedServiceName(service.name, device.serial),
+        type: SERVICE_TYPE,
+        protocol: 'tcp',
+        port: relayAddress.port,
+      });
+      publication.on('error', (error) => {
+        console.error(`Could not advertise bridge for ${service.name}: ${error.message}`);
+      });
+
+      bridges.set(key, { adbPort, device: device.serial, publication, relay, service, sockets });
+      activated = true;
+      console.log(
+        `Bridged ${service.name}: Mac:${relayAddress.port} -> ${device.serial}:${service.port}`
+      );
+    } catch (error) {
+      console.error(`Could not bridge ${service.name} on ${device.serial}: ${error.message}`);
+    } finally {
+      if (!activated) {
+        sockets?.forEach((socket) => socket.destroy());
+        if (relay?.listening) await closeServer(relay);
+        if (adbPort) await removeAdbForward(device.serial, adbPort);
+      }
     }
   } finally {
     pendingServices.delete(key);
-    const hasNewDevice = emulatorDevices.some((device) => !devicesToProbe.includes(device));
+    const startingSerials = devicesAtStart.map((device) => device.serial);
+    const hasNewDevice = emulatorDevices.some(
+      (device) => !startingSerials.includes(device.serial)
+    );
     if (!stopping && !bridges.has(key) && sourceServices.has(key) && hasNewDevice) {
       void startBridge(bonjour, sourceServices.get(key));
     }
@@ -215,19 +258,32 @@ async function refreshEmulatorDevices(bonjour) {
   refreshingDevices = true;
   try {
     const nextDevices = await listEmulatorDevices();
-    if (nextDevices.join('\0') === emulatorDevices.join('\0')) return;
+    const nextIdentity = nextDevices
+      .map((device) => `${device.serial}:${device.addresses.join(',')}`)
+      .join('\0');
+    const currentIdentity = emulatorDevices
+      .map((device) => `${device.serial}:${device.addresses.join(',')}`)
+      .join('\0');
+    if (nextIdentity === currentIdentity) return;
 
-    const removedDevices = emulatorDevices.filter((device) => !nextDevices.includes(device));
+    const changedDevices = emulatorDevices
+      .filter((device) => {
+        const nextDevice = nextDevices.find((candidate) => candidate.serial === device.serial);
+        return !nextDevice || nextDevice.addresses.join(',') !== device.addresses.join(',');
+      })
+      .map((device) => device.serial);
     emulatorDevices = nextDevices;
     console.log(
       emulatorDevices.length > 0
-        ? `Watching Android emulators: ${emulatorDevices.join(', ')}`
+        ? `Watching Android emulators: ${emulatorDevices
+            .map((device) => `${device.serial} (${device.addresses.join(', ')})`)
+            .join(', ')}`
         : 'Waiting for an Android emulator'
     );
 
     await Promise.all(
       [...bridges]
-        .filter(([, bridge]) => removedDevices.includes(bridge.device))
+        .filter(([, bridge]) => changedDevices.includes(bridge.device))
         .map(([key]) => stopBridge(key))
     );
     scheduleSourceServices(bonjour);
@@ -302,5 +358,7 @@ module.exports = {
   bridgedServiceName,
   canConnect,
   isBridgeService,
+  matchingEmulator,
   parseEmulatorDevices,
+  parseIpv4Addresses,
 };

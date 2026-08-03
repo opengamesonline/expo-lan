@@ -6,7 +6,9 @@ const {
   bridgedServiceName,
   canConnect,
   isBridgeService,
+  matchingEmulator,
   parseEmulatorDevices,
+  parseIpv4Addresses,
 } = require('./emulator-bridge.cjs');
 
 test('uses a sidecar-specific hostname for proxy advertisements', () => {
@@ -35,6 +37,22 @@ test('parses all online Android emulators from adb output', () => {
   ].join('\n');
 
   assert.deepEqual(parseEmulatorDevices(output), ['emulator-5554', 'emulator-5556']);
+});
+
+test('matches a service to the emulator with its unique guest address', () => {
+  const devices = [
+    { serial: 'emulator-5554', addresses: ['10.0.2.15', '10.0.2.16'] },
+    { serial: 'emulator-5556', addresses: ['10.0.2.15', '10.0.2.17'] },
+  ];
+  const service = { addresses: ['10.0.2.15', '10.0.2.17'] };
+
+  assert.deepEqual(matchingEmulator(service, devices), devices[1]);
+  assert.deepEqual(
+    parseIpv4Addresses(
+      '15: eth0 inet 10.0.2.15/24 scope global\n16: wlan0 inet 10.0.2.17/24 scope global'
+    ),
+    ['10.0.2.15', '10.0.2.17']
+  );
 });
 
 test('detects whether an ADB forwarding port accepts connections', async (t) => {

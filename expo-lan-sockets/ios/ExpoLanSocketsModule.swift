@@ -1,7 +1,7 @@
 import ExpoModulesCore
 import Network
 
-private let maxConnections = 8
+private let maxConnections = 32
 private let connectTimeout: TimeInterval = 10
 
 private struct ServerOptions: Record {

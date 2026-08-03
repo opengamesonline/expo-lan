@@ -62,7 +62,7 @@ internal class TcpManager(
   private val serverSocketFactory: () -> ServerSocket = { ServerSocket(0) },
   private val clientSocketFactory: () -> Socket = { Socket() },
   private val idFactory: () -> String = { UUID.randomUUID().toString() },
-  private val maxConnections: Int = 8,
+  private val maxConnections: Int = 32,
   private val connectTimeoutMs: Int = 10_000
 ) : AutoCloseable {
   private val stateLock = Any()

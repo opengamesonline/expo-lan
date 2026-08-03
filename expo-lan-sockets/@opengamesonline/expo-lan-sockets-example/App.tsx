@@ -102,6 +102,18 @@ export default function App() {
     }
   }
 
+  async function refreshGames() {
+    setBusy(true);
+    setError(null);
+    try {
+      await multiplayer.refreshDiscovery();
+    } catch (cause) {
+      setError(errorMessage(cause));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function leaveGame() {
     if (!session) return;
     setBusy(true);
@@ -177,7 +189,13 @@ export default function App() {
           />
         ) : null}
         {screen === 'games' ? (
-          <Games games={games} busy={busy} onJoin={joinGame} onBack={backFromGames} />
+          <Games
+            games={games}
+            busy={busy}
+            onJoin={joinGame}
+            onRefresh={refreshGames}
+            onBack={backFromGames}
+          />
         ) : null}
         {screen === 'session' && snapshot?.phase === 'lobby' ? (
           <Lobby snapshot={snapshot} busy={busy} onStart={startGame} onLeave={leaveGame} />
@@ -232,6 +250,7 @@ function Games(props: {
   games: DiscoveredService[];
   busy: boolean;
   onJoin(game: DiscoveredService): void;
+  onRefresh(): void;
   onBack(): void;
 }) {
   return (
@@ -246,7 +265,8 @@ function Games(props: {
           <Text style={styles.join}>JOIN</Text>
         </Pressable>
       ))}
-      <ActionButton label="Back" onPress={props.onBack} />
+      <ActionButton label="Refresh" disabled={props.busy} onPress={props.onRefresh} />
+      <ActionButton label="Back" disabled={props.busy} onPress={props.onBack} />
     </View>
   );
 }

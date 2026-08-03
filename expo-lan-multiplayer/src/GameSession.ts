@@ -19,6 +19,7 @@ export class GameSession<State, GameEvent> {
   private readonly decoders = new Map<string, MessageDecoder<State, GameEvent>>();
   private readonly connectionPlayers = new Map<string, Player>();
   private readonly playerConnections = new Map<string, string>();
+  private readonly watcherConnections = new Set<string>();
   private connectionId: string | null = null;
   private status: SessionStatus;
   private phase: GamePhase = 'lobby';
@@ -92,12 +93,15 @@ export class GameSession<State, GameEvent> {
     if (this.state === null) throw new Error('The game state is not ready');
     this.phase = 'started';
     this.emit();
-    await this.broadcast({
-      v: PROTOCOL_VERSION,
-      kind: 'gameStarted',
-      state: this.state,
-      revision: this.revision,
-    });
+    await Promise.all([
+      this.broadcast({
+        v: PROTOCOL_VERSION,
+        kind: 'gameStarted',
+        state: this.state,
+        revision: this.revision,
+      }),
+      this.closeWatchers(),
+    ]);
   }
 
   async leaveGame(): Promise<void> {
@@ -107,6 +111,7 @@ export class GameSession<State, GameEvent> {
     this.emit();
     try {
       if (this.role === 'host') {
+        this.watcherConnections.clear();
         await this.transport.stopServerAsync();
       } else if (this.connectionId && !wasDisconnected) {
         try {
@@ -135,10 +140,16 @@ export class GameSession<State, GameEvent> {
     const decoder = this.decoders.get(connectionId);
     if (!decoder) return;
     try {
-      for (const message of decoder.push(data)) void this.handleMessage(connectionId, message);
+      for (const message of decoder.push(data)) {
+        void this.handleMessage(connectionId, message).catch((cause) => {
+          if (this.status === 'left') return;
+          this.fail(cause instanceof Error ? cause.message : 'Could not handle LAN message');
+          void this.transport.disconnectAsync(connectionId).catch(() => undefined);
+        });
+      }
     } catch (cause) {
       this.fail(cause instanceof Error ? cause.message : 'Invalid LAN message');
-      void this.transport.disconnectAsync(connectionId);
+      void this.transport.disconnectAsync(connectionId).catch(() => undefined);
     }
   }
 
@@ -151,7 +162,14 @@ export class GameSession<State, GameEvent> {
       this.emit();
       return;
     }
-    if (this.role === 'host') void this.removePlayer(connectionId);
+    if (this.role === 'host') {
+      if (this.watcherConnections.delete(connectionId)) return;
+      if (this.status === 'left') {
+        this.forgetPlayer(connectionId);
+        return;
+      }
+      void this.removePlayer(connectionId).catch(() => undefined);
+    }
   }
 
   fail(message: string): void {
@@ -174,6 +192,10 @@ export class GameSession<State, GameEvent> {
     connectionId: string,
     message: WireMessage<State, GameEvent>
   ): Promise<void> {
+    if (message.kind === 'watch') {
+      await this.acceptWatcher(connectionId);
+      return;
+    }
     if (message.kind === 'join') {
       await this.acceptPlayer(connectionId, message.playerName);
       return;
@@ -183,7 +205,7 @@ export class GameSession<State, GameEvent> {
     if (message.kind === 'gameEvent') await this.applyEvent(message.event, player);
     if (message.kind === 'leave') {
       await this.removePlayer(connectionId);
-      await this.transport.disconnectAsync(connectionId);
+      await this.transport.disconnectAsync(connectionId).catch(() => undefined);
     }
   }
 
@@ -253,13 +275,47 @@ export class GameSession<State, GameEvent> {
   }
 
   private async removePlayer(connectionId: string): Promise<void> {
-    const player = this.connectionPlayers.get(connectionId);
+    const player = this.forgetPlayer(connectionId);
     if (!player) return;
+    if (this.status === 'left') return;
+    await this.broadcastBestEffort({ v: PROTOCOL_VERSION, kind: 'playerLeft', playerId: player.id });
+    this.emit();
+  }
+
+  private forgetPlayer(connectionId: string): Player | undefined {
+    const player = this.connectionPlayers.get(connectionId);
+    if (!player) return undefined;
     this.connectionPlayers.delete(connectionId);
     this.playerConnections.delete(player.id);
     this.players = this.players.filter((candidate) => candidate.id !== player.id);
-    await this.broadcast({ v: PROTOCOL_VERSION, kind: 'playerLeft', playerId: player.id });
-    this.emit();
+    return player;
+  }
+
+  private async acceptWatcher(connectionId: string): Promise<void> {
+    if (this.watcherConnections.has(connectionId)) return;
+    this.watcherConnections.add(connectionId);
+    try {
+      await this.send(connectionId, {
+        v: PROTOCOL_VERSION,
+        kind: 'watching',
+        phase: this.phase,
+      });
+      if (this.phase !== 'lobby' || this.status !== 'connected') {
+        this.watcherConnections.delete(connectionId);
+        await this.transport.disconnectAsync(connectionId);
+      }
+    } catch (error) {
+      this.watcherConnections.delete(connectionId);
+      throw error;
+    }
+  }
+
+  private async closeWatchers(): Promise<void> {
+    const connectionIds = [...this.watcherConnections];
+    this.watcherConnections.clear();
+    await Promise.allSettled(
+      connectionIds.map((connectionId) => this.transport.disconnectAsync(connectionId))
+    );
   }
 
   private async applyEvent(event: GameEvent, player: Player): Promise<void> {
@@ -288,6 +344,15 @@ export class GameSession<State, GameEvent> {
       .filter((connectionId) => connectionId !== excludedConnectionId)
       .map((connectionId) => this.transport.sendAsync(connectionId, data));
     await Promise.all(sends);
+  }
+
+  private async broadcastBestEffort(message: WireMessage<State, GameEvent>): Promise<void> {
+    const data = encodeMessage(message);
+    await Promise.allSettled(
+      [...this.playerConnections.values()].map((connectionId) =>
+        this.transport.sendAsync(connectionId, data)
+      )
+    );
   }
 
   private emit(): void {

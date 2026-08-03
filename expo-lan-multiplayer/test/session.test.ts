@@ -2,11 +2,13 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { GameSession } from '../src/GameSession';
+import { encodeMessage, MessageDecoder, type WireMessage } from '../src/protocol';
 import type { SessionTransport } from '../src/SessionTransport';
 
 type TileState = { tiles: Array<number | null> };
 type TileEvent = { type: 'claimTile'; tile: number };
 type TestSession = GameSession<TileState, TileEvent>;
+type SessionPeer = Pick<TestSession, 'receive' | 'disconnected'>;
 
 class SessionOwner {
   ended = 0;
@@ -17,15 +19,31 @@ class SessionOwner {
 }
 
 type Link = {
-  client: TestSession;
+  client: SessionPeer;
   clientConnectionId: string;
 };
+
+class WatchPeer implements SessionPeer {
+  readonly messages: Array<WireMessage<TileState, TileEvent>> = [];
+  disconnectedFromHost = false;
+  private readonly decoder = new MessageDecoder<TileState, TileEvent>();
+
+  receive(_connectionId: string, data: Uint8Array): void {
+    this.messages.push(...this.decoder.push(data));
+  }
+
+  disconnected(_connectionId: string): void {
+    this.disconnectedFromHost = true;
+  }
+}
 
 class HostTransport implements SessionTransport {
   host!: TestSession;
   readonly links = new Map<string, Link>();
+  delaySends = false;
 
   async sendAsync(connectionId: string, data: Uint8Array): Promise<void> {
+    if (this.delaySends) await settle();
     const link = this.links.get(connectionId);
     if (!link) throw new Error(`Unknown host connection ${connectionId}`);
     link.client.receive(link.clientConnectionId, data.slice());
@@ -107,6 +125,17 @@ async function joinClient(host: ReturnType<typeof createHost>, index = 1) {
   return { owner, session, transport };
 }
 
+async function watchHost(host: ReturnType<typeof createHost>, index = 1) {
+  const hostConnectionId = `host-watch-${index}`;
+  const clientConnectionId = `client-watch-${index}`;
+  const peer = new WatchPeer();
+  host.transport.links.set(hostConnectionId, { client: peer, clientConnectionId });
+  host.session.attachIncoming(hostConnectionId);
+  host.session.receive(hostConnectionId, encodeMessage({ v: 1, kind: 'watch' }));
+  await settle();
+  return peer;
+}
+
 test('creates a lobby and joins a client', async () => {
   const host = createHost();
   const client = await joinClient(host);
@@ -167,6 +196,43 @@ test('notifies a client when the host closes the lobby', async () => {
   assert.equal(client.session.snapshot.status, 'disconnected');
   assert.deepEqual(client.session.snapshot.players.map((player) => player.name), ['Client 1']);
   assert.equal(host.owner.ended, 1);
+});
+
+test('keeps watchers out of the player list and closes them when the game starts', async () => {
+  const host = createHost();
+  const watcher = await watchHost(host);
+
+  assert.deepEqual(watcher.messages, [{ v: 1, kind: 'watching', phase: 'lobby' }]);
+  assert.deepEqual(host.session.snapshot.players.map((player) => player.name), ['Host']);
+
+  await host.session.startGame();
+  await settle();
+
+  assert.equal(watcher.disconnectedFromHost, true);
+});
+
+test('closes watcher connections when the host cancels the game', async () => {
+  const host = createHost();
+  const watcher = await watchHost(host);
+
+  await host.session.leaveGame();
+  await settle();
+
+  assert.equal(watcher.disconnectedFromHost, true);
+});
+
+test('closes a host with multiple clients without rejected cleanup sends', async () => {
+  const host = createHost();
+  await joinClient(host, 1);
+  await joinClient(host, 2);
+  await joinClient(host, 3);
+  host.transport.delaySends = true;
+
+  await host.session.leaveGame();
+  await settle();
+
+  assert.equal(host.session.snapshot.status, 'left');
+  assert.deepEqual(host.session.snapshot.players.map((player) => player.name), ['Host']);
 });
 
 test('rejects a late join after the game starts', async () => {

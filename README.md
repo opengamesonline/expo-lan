@@ -10,6 +10,8 @@ Native LAN multiplayer transport and host-authoritative sessions for Expo applic
 
 The MVP supports one advertised server, one discovery operation, multiple clients, create/join/leave flows, and generic game events. It is foreground-only and does not implement authentication, reconnection, host migration, or background hosting.
 
+While the game browser is open, the multiplayer package maintains one idle watcher TCP connection to each available lobby. Watchers are not players and send no periodic traffic. Starting or cancelling a game closes its watcher connections, removing the listing immediately without waiting for Bonjour/NSD cache expiry.
+
 The iOS app must declare `NSLocalNetworkUsageDescription` and list `_expo-lan-game._tcp` in `NSBonjourServices`. The example app includes both declarations in `app.json`.
 
 ## Prerequisites
@@ -118,7 +120,7 @@ cd expo-lan-sockets/@opengamesonline/expo-lan-sockets-example
 npm run bridge
 ```
 
-The script starts Metro and an external sidecar that monitors every running `emulator-*` device from `adb devices`. Emulators can be started or stopped while the sidecar runs. When an emulator advertises a game, the sidecar probes its dynamic port through each AVD, keeps the matching ADB forward, starts a TCP relay on the Mac, and publishes a labeled Bonjour proxy. The application and native modules continue using their normal dynamic ports and Bonjour connection path.
+The script starts Metro and an external sidecar that monitors every running `emulator-*` device from `adb devices`. Emulators can be started or stopped while the sidecar runs. When an emulator advertises a game, the sidecar matches its Bonjour address to the AVD's guest interfaces, verifies its dynamic port, creates the matching ADB forward, starts a TCP relay on the Mac, and publishes a labeled Bonjour proxy. The application and native modules continue using their normal dynamic ports and Bonjour connection path.
 
 Leave the script running, create the game on any Android emulator, choose **Find games** on iOS, and join the service named `Game name [bridge emulator-5554]`. Do not select the original service because it still resolves through the emulator's unreachable NAT path. Press **Ctrl-C** to stop Metro and remove all proxy advertisements, relays, and ADB forwarding rules.
 

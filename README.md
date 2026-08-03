@@ -8,11 +8,25 @@ Native LAN multiplayer transport and host-authoritative sessions for Expo applic
 - On iOS, the socket package uses `NWListener`, `NWBrowser`, and `NWConnection` from Network.framework.
 - `@opengamesonline/expo-lan-multiplayer` adds message framing and host-authoritative TypeScript game sessions.
 
-The MVP supports one advertised server, one discovery operation, multiple clients, create/join/leave flows, and generic game events. It is foreground-only and does not implement authentication, reconnection, host migration, or background hosting.
+The MVP supports one advertised server, one discovery operation, multiple clients, create/join/leave flows, and generic game events.
 
 While the game browser is open, the multiplayer package maintains one idle watcher TCP connection to each available lobby. Watchers are not players and send no periodic traffic. Starting or cancelling a game closes its watcher connections, removing the listing immediately without waiting for Bonjour/NSD cache expiry.
 
 The iOS app must declare `NSLocalNetworkUsageDescription` and list `_expo-lan-game._tcp` in `NSBonjourServices`. The example app includes both declarations in `app.json`.
+
+## Current Limitations
+
+- Sessions are foreground-only. Backgrounding the app, switching apps, or locking the device may suspend networking and JavaScript execution. Connections might survive briefly, but background hosting and gameplay are not supported.
+- Sessions do not reconnect or resume after a connection is lost. Returning an app to the foreground does not automatically restore its previous session or synchronize missed state.
+- Host migration is not supported. If the host leaves, disconnects, or is suspended, the session ends for every client.
+- Traffic is not authenticated or encrypted. Player identity is session-local, and the host is trusted as the authority. Use the packages only on trusted local networks unless the application adds its own security layer.
+- Discovery and connections are LAN-only. There is no internet matchmaking, relay service, NAT traversal, or support for routers that block multicast DNS or isolate Wi-Fi clients.
+- The native socket module supports one advertised server and one discovery operation at a time. A `LanMultiplayer` instance supports one active game session at a time.
+- Native transport capacity is limited to 32 simultaneous connections. Game-browser watcher connections count toward this limit alongside joined players.
+- Game event payloads are application-defined. TypeScript types are not runtime validation; hosts must validate untrusted event contents in their reducers before applying state changes.
+- The packages require a native development or production build and do not run in Expo Go or on the web.
+- Bonjour and NSD timing depends on the platform and network. The example includes a manual **Refresh** action because Android emulators can delay discovering a game created after browsing has already started.
+- Emulator networking does not fully represent a physical LAN. The development bridge supports Android-emulator hosts connecting to an iOS Simulator, but it is test tooling rather than production functionality.
 
 ## Prerequisites
 

@@ -18,13 +18,16 @@ import type {
   DiscoveredGame,
   GamesListener,
   JoinGameOptions,
-  LobbyInfo,
+  JsonValue,
 } from './types';
 
 type Subscription = { remove(): void };
-type GameWatch = {
+type GameWatch<
+  ParticipantMetadata extends JsonValue,
+  LobbyMetadata extends JsonValue,
+> = {
   connectionId: string;
-  decoder: MessageDecoder<unknown, unknown>;
+  decoder: MessageDecoder<unknown, unknown, ParticipantMetadata, LobbyMetadata>;
   timeout: ReturnType<typeof setTimeout>;
 };
 
@@ -32,18 +35,34 @@ const SERVICE_ID_LENGTH = 6;
 const CONNECT_ATTEMPTS = 3;
 const CONNECT_RETRY_DELAY_MS = 500;
 
-export class LanMultiplayer {
+export class LanMultiplayer<
+  ParticipantMetadata extends JsonValue = JsonValue,
+  LobbyMetadata extends JsonValue = JsonValue,
+> {
   private readonly games = new Map<string, DiscoveredService>();
-  private readonly gameLobbies = new Map<string, LobbyInfo>();
+  private readonly gameLobbyMetadata = new Map<string, LobbyMetadata>();
   private readonly serviceHosts = new Map<string, string>();
-  private readonly gamesListeners = new Set<GamesListener>();
-  private readonly gameWatches = new Map<string, GameWatch>();
+  private readonly gamesListeners = new Set<GamesListener<LobbyMetadata>>();
+  private readonly gameWatches = new Map<
+    string,
+    GameWatch<ParticipantMetadata, LobbyMetadata>
+  >();
   private readonly watchConnections = new Map<string, string>();
   private readonly pendingWatches = new Set<string>();
   private readonly subscriptions: Subscription[];
   private readonly hostId = randomId();
-  private activeSession: GameSession<unknown, unknown> | null = null;
-  private pendingJoinSession: GameSession<unknown, unknown> | null = null;
+  private activeSession: GameSession<
+    unknown,
+    unknown,
+    ParticipantMetadata,
+    LobbyMetadata
+  > | null = null;
+  private pendingJoinSession: GameSession<
+    unknown,
+    unknown,
+    ParticipantMetadata,
+    LobbyMetadata
+  > | null = null;
   private joinAttempt = 0;
   private discovering = false;
   private stoppingDiscovery: Promise<void> | null = null;
@@ -94,7 +113,7 @@ export class LanMultiplayer {
     return ExpoLanSockets.capabilities;
   }
 
-  subscribeToGames(listener: GamesListener): () => void {
+  subscribeToGames(listener: GamesListener<LobbyMetadata>): () => void {
     this.gamesListeners.add(listener);
     listener(this.gameList());
     return () => this.gamesListeners.delete(listener);
@@ -118,7 +137,7 @@ export class LanMultiplayer {
     this.discovering = false;
     this.watchGeneration += 1;
     this.games.clear();
-    this.gameLobbies.clear();
+    this.gameLobbyMetadata.clear();
     this.serviceHosts.clear();
     this.emitGames();
     const operation = Promise.all([
@@ -139,12 +158,27 @@ export class LanMultiplayer {
   }
 
   async createGame<State, GameEvent>(
-    options: CreateGameOptions<State, GameEvent>
-  ): Promise<GameSession<State, GameEvent>> {
+    options: CreateGameOptions<
+      State,
+      GameEvent,
+      ParticipantMetadata,
+      LobbyMetadata
+    >
+  ): Promise<GameSession<State, GameEvent, ParticipantMetadata, LobbyMetadata>> {
     this.assertNoSession();
     if (this.discovering) await this.stopDiscovery();
-    const session = GameSession.host<State, GameEvent>(this, ExpoLanSockets, options);
-    this.activeSession = session as GameSession<unknown, unknown>;
+    const session = GameSession.host<
+      State,
+      GameEvent,
+      ParticipantMetadata,
+      LobbyMetadata
+    >(this, ExpoLanSockets, options);
+    this.activeSession = session as GameSession<
+      unknown,
+      unknown,
+      ParticipantMetadata,
+      LobbyMetadata
+    >;
     try {
       const name = (options.name.trim() || 'LAN Game').slice(0, 32);
       const serviceName = `${name}~${this.hostId}~${randomId()}`;
@@ -156,11 +190,28 @@ export class LanMultiplayer {
     }
   }
 
-  async joinGame<State, GameEvent>(options: JoinGameOptions): Promise<GameSession<State, GameEvent>> {
+  async joinGame<State, GameEvent>(
+    options: JoinGameOptions<ParticipantMetadata, LobbyMetadata>
+  ): Promise<GameSession<State, GameEvent, ParticipantMetadata, LobbyMetadata>> {
     this.assertNoSession();
-    const session = GameSession.client<State, GameEvent>(this, ExpoLanSockets);
-    this.activeSession = session as GameSession<unknown, unknown>;
-    this.pendingJoinSession = session as GameSession<unknown, unknown>;
+    const session = GameSession.client<
+      State,
+      GameEvent,
+      ParticipantMetadata,
+      LobbyMetadata
+    >(this, ExpoLanSockets);
+    this.activeSession = session as GameSession<
+      unknown,
+      unknown,
+      ParticipantMetadata,
+      LobbyMetadata
+    >;
+    this.pendingJoinSession = session as GameSession<
+      unknown,
+      unknown,
+      ParticipantMetadata,
+      LobbyMetadata
+    >;
     const attempt = ++this.joinAttempt;
     let connectionId: string | null = null;
     try {
@@ -168,7 +219,11 @@ export class LanMultiplayer {
       const connection = await this.connectToGame(options.service, hostId, attempt);
       connectionId = connection.connectionId;
       this.assertJoinActive(attempt);
-      await session.attachServer(connection.connectionId, options.playerName);
+      await session.attachServer(
+        connection.connectionId,
+        options.participantName,
+        options.participantMetadata
+      );
       this.assertJoinActive(attempt);
       if (this.discovering) void this.stopDiscovery().catch(() => undefined);
       return session;
@@ -189,7 +244,9 @@ export class LanMultiplayer {
     if (this.activeSession === session) this.activeSession = null;
   }
 
-  sessionEnded(session: GameSession<unknown, unknown>): void {
+  sessionEnded(
+    session: GameSession<unknown, unknown, ParticipantMetadata, LobbyMetadata>
+  ): void {
     if (this.activeSession === session) this.activeSession = null;
   }
 
@@ -204,11 +261,16 @@ export class LanMultiplayer {
     if (this.activeSession) throw new Error('Leave the current game before starting another one');
   }
 
-  private gameList(): DiscoveredGame[] {
+  private gameList(): DiscoveredGame<LobbyMetadata>[] {
     return [...this.games.values()]
       .flatMap((game) => {
-        const lobby = this.gameLobbies.get(game.serviceId);
-        return lobby ? [{ ...game, lobby }] : [];
+        if (!this.gameLobbyMetadata.has(game.serviceId)) return [];
+        return [
+          {
+            ...game,
+            lobbyMetadata: this.gameLobbyMetadata.get(game.serviceId) as LobbyMetadata,
+          },
+        ];
       })
       .sort((left, right) => left.name.localeCompare(right.name));
   }
@@ -243,7 +305,7 @@ export class LanMultiplayer {
         return;
       }
 
-      const watch: GameWatch = {
+      const watch: GameWatch<ParticipantMetadata, LobbyMetadata> = {
         connectionId: connection.connectionId,
         decoder: new MessageDecoder(),
         timeout: setTimeout(() => {
@@ -282,12 +344,12 @@ export class LanMultiplayer {
           this.removeUnavailableGame(serviceId);
           return true;
         }
-        if (!isLobbyInfo(message.lobby)) {
+        if (!isJsonValue(message.lobbyMetadata)) {
           this.removeUnavailableGame(serviceId);
           return true;
         }
         clearTimeout(watch.timeout);
-        this.gameLobbies.set(serviceId, message.lobby);
+        this.gameLobbyMetadata.set(serviceId, message.lobbyMetadata as LobbyMetadata);
         this.emitGames();
       }
     } catch {
@@ -305,7 +367,7 @@ export class LanMultiplayer {
       this.gameWatches.delete(serviceId);
     }
     this.watchConnections.delete(connectionId);
-    const wasVisible = this.gameLobbies.delete(serviceId);
+    const wasVisible = this.gameLobbyMetadata.delete(serviceId);
     this.games.delete(serviceId);
     this.serviceHosts.delete(serviceId);
     if (this.discovering && wasVisible) {
@@ -315,7 +377,7 @@ export class LanMultiplayer {
   }
 
   private removeGame(serviceId: string): boolean {
-    const removed = this.gameLobbies.delete(serviceId);
+    const removed = this.gameLobbyMetadata.delete(serviceId);
     this.games.delete(serviceId);
     this.serviceHosts.delete(serviceId);
     const watch = this.gameWatches.get(serviceId);
@@ -380,16 +442,16 @@ function delay(milliseconds: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
-function isLobbyInfo(value: unknown): value is LobbyInfo {
-  if (typeof value !== 'object' || value === null) return false;
-  const lobby = value as Partial<LobbyInfo>;
-  return (
-    Number.isInteger(lobby.playerCount) &&
-    Number.isInteger(lobby.minPlayers) &&
-    Number.isInteger(lobby.maxPlayers) &&
-    (lobby.playerCount ?? 0) >= 1 &&
-    (lobby.minPlayers ?? 0) >= 1 &&
-    (lobby.minPlayers ?? 0) <= (lobby.maxPlayers ?? 0) &&
-    (lobby.playerCount ?? 0) <= (lobby.maxPlayers ?? 0)
-  );
+function isJsonValue(value: unknown): value is JsonValue {
+  if (
+    value === null ||
+    typeof value === 'boolean' ||
+    typeof value === 'string' ||
+    (typeof value === 'number' && Number.isFinite(value))
+  ) {
+    return true;
+  }
+  if (Array.isArray(value)) return value.every(isJsonValue);
+  if (typeof value !== 'object') return false;
+  return Object.values(value).every(isJsonValue);
 }

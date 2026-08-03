@@ -2,18 +2,39 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { GameSession } from '../src/GameSession';
-import { encodeMessage, MessageDecoder, type WireMessage } from '../src/protocol';
+import {
+  encodeMessage,
+  MessageDecoder,
+  PROTOCOL_VERSION,
+  type WireMessage,
+} from '../src/protocol';
 import type { SessionTransport } from '../src/SessionTransport';
 
-type TileState = { tiles: Array<number | null> };
+type TileState = {
+  tiles: Array<number | null>;
+  playerIds: string[];
+};
 type TileEvent = { type: 'claimTile'; tile: number };
-type TestSession = GameSession<TileState, TileEvent>;
+type ParticipantMetadata = { role: 'player' | 'spectator' };
+type LobbyMetadata = {
+  playerCount: number;
+  spectatorCount: number;
+  maxPlayers: number;
+};
+type TestSession = GameSession<
+  TileState,
+  TileEvent,
+  ParticipantMetadata,
+  LobbyMetadata
+>;
 type SessionPeer = Pick<TestSession, 'receive' | 'disconnected'>;
 
 class SessionOwner {
   ended = 0;
 
-  sessionEnded(_session: GameSession<unknown, unknown>): void {
+  sessionEnded(
+    _session: GameSession<unknown, unknown, ParticipantMetadata, LobbyMetadata>
+  ): void {
     this.ended += 1;
   }
 }
@@ -24,9 +45,16 @@ type Link = {
 };
 
 class WatchPeer implements SessionPeer {
-  readonly messages: Array<WireMessage<TileState, TileEvent>> = [];
+  readonly messages: Array<
+    WireMessage<TileState, TileEvent, ParticipantMetadata, LobbyMetadata>
+  > = [];
   disconnectedFromHost = false;
-  private readonly decoder = new MessageDecoder<TileState, TileEvent>();
+  private readonly decoder = new MessageDecoder<
+    TileState,
+    TileEvent,
+    ParticipantMetadata,
+    LobbyMetadata
+  >();
 
   receive(_connectionId: string, data: Uint8Array): void {
     this.messages.push(...this.decoder.push(data));
@@ -92,36 +120,92 @@ class ClientTransport implements SessionTransport {
   }
 }
 
-function createHost(capacity: { minPlayers?: number; maxPlayers?: number } = {}) {
+function createHost({
+  hostRole = 'player',
+  minPlayers = 1,
+  maxPlayers = 8,
+}: {
+  hostRole?: ParticipantMetadata['role'];
+  minPlayers?: number;
+  maxPlayers?: number;
+} = {}) {
   const owner = new SessionOwner();
   const transport = new HostTransport();
-  const session = GameSession.host<TileState, TileEvent>(owner, transport, {
+  const session = GameSession.host<
+    TileState,
+    TileEvent,
+    ParticipantMetadata,
+    LobbyMetadata
+  >(owner, transport, {
     name: 'Test game',
-    playerName: 'Host',
-    initialState: { tiles: Array<number | null>(9).fill(null) },
-    ...capacity,
-    reduceEvent(state, event, player) {
+    participantName: 'Host',
+    participantMetadata: { role: hostRole },
+    createInitialState(participants) {
+      return {
+        tiles: Array<number | null>(9).fill(null),
+        playerIds: participants
+          .filter(({ metadata }) => metadata.role === 'player')
+          .map(({ id }) => id),
+      };
+    },
+    getLobbyMetadata(participants) {
+      return {
+        playerCount: participants.filter(({ metadata }) => metadata.role === 'player').length,
+        spectatorCount: participants.filter(({ metadata }) => metadata.role === 'spectator')
+          .length,
+        maxPlayers,
+      };
+    },
+    validateJoin(candidate, participants) {
+      if (participants.some(({ name }) => name === candidate.name)) {
+        return 'That participant name is already in use';
+      }
+      const playerCount = participants.filter(
+        ({ metadata }) => metadata.role === 'player'
+      ).length;
+      return candidate.metadata.role === 'player' && playerCount >= maxPlayers
+        ? 'The player roster is full'
+        : null;
+    },
+    validateStart(participants) {
+      const playerCount = participants.filter(
+        ({ metadata }) => metadata.role === 'player'
+      ).length;
+      return playerCount < minPlayers ? `At least ${minPlayers} players are required` : null;
+    },
+    reduceEvent(state, event, participant) {
+      if (participant.metadata.role === 'spectator') return state;
       const tiles = [...state.tiles];
       if (event.type === 'claimTile' && event.tile >= 0 && event.tile < tiles.length) {
-        tiles[event.tile] = player.slot;
+        tiles[event.tile] = participant.slot;
       }
-      return { tiles };
+      return { ...state, tiles };
     },
   });
   transport.host = session;
   return { owner, session, transport };
 }
 
-async function joinClient(host: ReturnType<typeof createHost>, index = 1) {
+async function joinClient(
+  host: ReturnType<typeof createHost>,
+  index = 1,
+  role: ParticipantMetadata['role'] = 'player',
+  name = `Client ${index}`
+) {
   const owner = new SessionOwner();
   const hostConnectionId = `host-${index}`;
   const clientConnectionId = `client-${index}`;
   const transport = new ClientTransport(host.transport, hostConnectionId, clientConnectionId);
-  const session = GameSession.client<TileState, TileEvent>(owner, transport);
+  const session = GameSession.client<
+    TileState,
+    TileEvent,
+    ParticipantMetadata,
+    LobbyMetadata
+  >(owner, transport);
   transport.client = session;
   host.transport.links.set(hostConnectionId, { client: session, clientConnectionId });
   host.session.attachIncoming(hostConnectionId);
-  await session.attachServer(clientConnectionId, `Client ${index}`);
+  await session.attachServer(clientConnectionId, name, { role });
   await settle();
   return { owner, session, transport };
 }
@@ -132,81 +216,97 @@ async function watchHost(host: ReturnType<typeof createHost>, index = 1) {
   const peer = new WatchPeer();
   host.transport.links.set(hostConnectionId, { client: peer, clientConnectionId });
   host.session.attachIncoming(hostConnectionId);
-  host.session.receive(hostConnectionId, encodeMessage({ v: 1, kind: 'watch' }));
+  host.session.receive(
+    hostConnectionId,
+    encodeMessage({ v: PROTOCOL_VERSION, kind: 'watch' })
+  );
   await settle();
   return peer;
 }
 
-test('creates a lobby and joins a client', async () => {
+test('creates a lobby and transports participant metadata', async () => {
   const host = createHost();
-  const client = await joinClient(host);
+  const client = await joinClient(host, 1, 'spectator');
 
   assert.equal(host.session.snapshot.phase, 'lobby');
-  assert.equal(client.session.snapshot.phase, 'lobby');
   assert.equal(client.session.snapshot.status, 'connected');
-  assert.deepEqual(host.session.snapshot.players.map((player) => player.name), ['Host', 'Client 1']);
-  assert.deepEqual(client.session.snapshot.players.map((player) => player.name), ['Host', 'Client 1']);
+  assert.deepEqual(
+    client.session.snapshot.participants.map(({ name, metadata }) => ({ name, metadata })),
+    [
+      { name: 'Host', metadata: { role: 'player' } },
+      { name: 'Client 1', metadata: { role: 'spectator' } },
+    ]
+  );
 });
 
-test('only the host can start and clients receive the transition', async () => {
-  const host = createHost();
-  const client = await joinClient(host);
+test('only the host can start and state is initialized from the finalized roster', async () => {
+  const host = createHost({ hostRole: 'spectator', minPlayers: 2 });
+  const firstPlayer = await joinClient(host, 1, 'player');
+  const secondPlayer = await joinClient(host, 2, 'player');
 
-  await assert.rejects(client.session.startGame(), /Only the host/);
+  assert.equal(host.session.snapshot.state, null);
+  assert.equal(firstPlayer.session.snapshot.state, null);
+  await assert.rejects(firstPlayer.session.startGame(), /Only the host/);
   await host.session.startGame();
   await settle();
 
   assert.equal(host.session.snapshot.phase, 'started');
-  assert.equal(client.session.snapshot.phase, 'started');
+  assert.deepEqual(host.session.snapshot.state?.playerIds, [
+    firstPlayer.session.snapshot.self?.id,
+    secondPlayer.session.snapshot.self?.id,
+  ]);
+  assert.deepEqual(firstPlayer.session.snapshot.state, host.session.snapshot.state);
 });
 
-test('enforces minimum and maximum lobby capacity', async () => {
+test('enforces app-defined join and start policy', async () => {
   const host = createHost({ minPlayers: 2, maxPlayers: 2 });
 
-  assert.deepEqual(host.session.snapshot.lobby, {
-    playerCount: 1,
-    minPlayers: 2,
-    maxPlayers: 2,
-  });
   await assert.rejects(host.session.startGame(), /At least 2 players/);
+  const player = await joinClient(host, 1, 'player');
+  const spectator = await joinClient(host, 2, 'spectator');
+  const rejectedPlayer = await joinClient(host, 3, 'player');
+  const duplicate = await joinClient(host, 4, 'spectator', 'Client 1');
 
-  const client = await joinClient(host, 1);
-  assert.equal(client.session.snapshot.status, 'connected');
-  assert.deepEqual(client.session.snapshot.lobby, {
-    playerCount: 2,
-    minPlayers: 2,
-    maxPlayers: 2,
-  });
-
-  const rejectedClient = await joinClient(host, 2);
-  assert.equal(rejectedClient.session.snapshot.status, 'disconnected');
-  assert.equal(host.session.snapshot.players.length, 2);
+  assert.equal(player.session.snapshot.status, 'connected');
+  assert.equal(spectator.session.snapshot.status, 'connected');
+  assert.equal(rejectedPlayer.session.snapshot.status, 'disconnected');
+  assert.equal(duplicate.session.snapshot.status, 'disconnected');
+  assert.equal(host.session.snapshot.participants.length, 3);
   await host.session.startGame();
 });
 
-test('synchronizes an authoritative tile update', async () => {
+test('passes the connection-bound participant to the authoritative reducer', async () => {
   const host = createHost();
-  const client = await joinClient(host);
+  const player = await joinClient(host, 1, 'player');
   await host.session.startGame();
 
-  await client.session.sendGameEvent({ type: 'claimTile', tile: 4 });
+  await player.session.sendGameEvent({ type: 'claimTile', tile: 4 });
   await settle();
 
-  const clientSlot = client.session.snapshot.self?.slot;
-  assert.equal(host.session.snapshot.state?.tiles[4], clientSlot);
-  assert.equal(client.session.snapshot.state?.tiles[4], clientSlot);
+  assert.equal(host.session.snapshot.state?.tiles[4], player.session.snapshot.self?.slot);
+  assert.equal(player.session.snapshot.state?.tiles[4], player.session.snapshot.self?.slot);
   assert.equal(host.session.snapshot.revision, 1);
-  assert.equal(client.session.snapshot.revision, 1);
 });
 
-test('removes a client that leaves the lobby', async () => {
+test('allows app policy to ignore spectator game events', async () => {
+  const host = createHost();
+  const spectator = await joinClient(host, 1, 'spectator');
+  await host.session.startGame();
+
+  await spectator.session.sendGameEvent({ type: 'claimTile', tile: 4 });
+  await settle();
+
+  assert.equal(host.session.snapshot.state?.tiles[4], null);
+});
+
+test('removes a participant that leaves the lobby', async () => {
   const host = createHost();
   const client = await joinClient(host);
 
   await client.session.leaveGame();
   await settle();
 
-  assert.deepEqual(host.session.snapshot.players.map((player) => player.name), ['Host']);
+  assert.deepEqual(host.session.snapshot.participants.map(({ name }) => name), ['Host']);
   assert.equal(client.session.snapshot.status, 'left');
   assert.equal(client.owner.ended, 1);
 });
@@ -219,23 +319,23 @@ test('notifies a client when the host closes the lobby', async () => {
   await settle();
 
   assert.equal(client.session.snapshot.status, 'disconnected');
-  assert.deepEqual(client.session.snapshot.players.map((player) => player.name), ['Client 1']);
+  assert.deepEqual(client.session.snapshot.participants.map(({ name }) => name), ['Client 1']);
   assert.equal(host.owner.ended, 1);
 });
 
-test('keeps watchers out of the player list and closes them when the game starts', async () => {
+test('keeps watchers out of the participant roster and closes them on start', async () => {
   const host = createHost();
   const watcher = await watchHost(host);
 
   assert.deepEqual(watcher.messages, [
     {
-      v: 1,
+      v: PROTOCOL_VERSION,
       kind: 'watching',
       phase: 'lobby',
-      lobby: { playerCount: 1, minPlayers: 1, maxPlayers: 8 },
+      lobbyMetadata: { playerCount: 1, spectatorCount: 0, maxPlayers: 8 },
     },
   ]);
-  assert.deepEqual(host.session.snapshot.players.map((player) => player.name), ['Host']);
+  assert.deepEqual(host.session.snapshot.participants.map(({ name }) => name), ['Host']);
 
   await host.session.startGame();
   await settle();
@@ -243,24 +343,29 @@ test('keeps watchers out of the player list and closes them when the game starts
   assert.equal(watcher.disconnectedFromHost, true);
 });
 
-test('updates watchers when lobby occupancy changes', async () => {
-  const host = createHost({ minPlayers: 2, maxPlayers: 4 });
+test('publishes live opaque lobby metadata when participants change', async () => {
+  const host = createHost({ maxPlayers: 4 });
   const watcher = await watchHost(host);
-  const client = await joinClient(host);
+  const spectator = await joinClient(host, 1, 'spectator');
 
-  assert.deepEqual(watcher.messages.map((message) => message.kind === 'watching' && message.lobby), [
-    { playerCount: 1, minPlayers: 2, maxPlayers: 4 },
-    { playerCount: 2, minPlayers: 2, maxPlayers: 4 },
-  ]);
+  assert.deepEqual(
+    watcher.messages.map(
+      (message) => message.kind === 'watching' && message.lobbyMetadata
+    ),
+    [
+      { playerCount: 1, spectatorCount: 0, maxPlayers: 4 },
+      { playerCount: 1, spectatorCount: 1, maxPlayers: 4 },
+    ]
+  );
 
-  await client.session.leaveGame();
+  await spectator.session.leaveGame();
   await settle();
 
   assert.deepEqual(watcher.messages.at(-1), {
-    v: 1,
+    v: PROTOCOL_VERSION,
     kind: 'watching',
     phase: 'lobby',
-    lobby: { playerCount: 1, minPlayers: 2, maxPlayers: 4 },
+    lobbyMetadata: { playerCount: 1, spectatorCount: 0, maxPlayers: 4 },
   });
 });
 
@@ -285,7 +390,7 @@ test('closes a host with multiple clients without rejected cleanup sends', async
   await settle();
 
   assert.equal(host.session.snapshot.status, 'left');
-  assert.deepEqual(host.session.snapshot.players.map((player) => player.name), ['Host']);
+  assert.deepEqual(host.session.snapshot.participants.map(({ name }) => name), ['Host']);
 });
 
 test('rejects a late join after the game starts', async () => {
@@ -294,7 +399,7 @@ test('rejects a late join after the game starts', async () => {
   const client = await joinClient(host);
 
   assert.equal(client.session.snapshot.status, 'disconnected');
-  assert.deepEqual(host.session.snapshot.players.map((player) => player.name), ['Host']);
+  assert.deepEqual(host.session.snapshot.participants.map(({ name }) => name), ['Host']);
 });
 
 async function settle(): Promise<void> {

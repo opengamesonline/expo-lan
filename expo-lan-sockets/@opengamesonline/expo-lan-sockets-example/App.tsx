@@ -19,20 +19,37 @@ import {
 
 type TileState = { tiles: Array<number | null> };
 type TileEvent = { type: 'claimTile'; tile: number };
+type TileParticipantMetadata = null;
+type TileLobbyMetadata = {
+  playerCount: number;
+  minPlayers: number;
+  maxPlayers: number;
+};
+type TileSession = GameSession<
+  TileState,
+  TileEvent,
+  TileParticipantMetadata,
+  TileLobbyMetadata
+>;
+type TileSnapshot = SessionSnapshot<
+  TileState,
+  TileParticipantMetadata,
+  TileLobbyMetadata
+>;
 type Screen = 'home' | 'games' | 'session';
 
 const PLAYER_COLORS = ['#F05D5E', '#36C5A3', '#F4B942', '#6C8CFF', '#C77DFF', '#FF8C42'];
 const MIN_PLAYERS = 2;
 const MAX_PLAYERS = PLAYER_COLORS.length;
-const multiplayer = new LanMultiplayer();
+const multiplayer = new LanMultiplayer<TileParticipantMetadata, TileLobbyMetadata>();
 
 export default function App() {
   const [screen, setScreen] = useState<Screen>('home');
   const [playerName, setPlayerName] = useState('Player');
   const [gameName, setGameName] = useState('Tile Clash');
-  const [games, setGames] = useState<DiscoveredGame[]>([]);
-  const [session, setSession] = useState<GameSession<TileState, TileEvent> | null>(null);
-  const [snapshot, setSnapshot] = useState<SessionSnapshot<TileState> | null>(null);
+  const [games, setGames] = useState<DiscoveredGame<TileLobbyMetadata>[]>([]);
+  const [session, setSession] = useState<TileSession | null>(null);
+  const [snapshot, setSnapshot] = useState<TileSnapshot | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const unsubscribeSession = useRef<(() => void) | null>(null);
@@ -40,7 +57,7 @@ export default function App() {
 
   useEffect(() => multiplayer.subscribeToGames(setGames), []);
 
-  function watchSession(nextSession: GameSession<TileState, TileEvent>) {
+  function watchSession(nextSession: TileSession) {
     unsubscribeSession.current?.();
     unsubscribeSession.current = nextSession.subscribe(setSnapshot);
     setSession(nextSession);
@@ -53,16 +70,35 @@ export default function App() {
     try {
       const nextSession = await multiplayer.createGame<TileState, TileEvent>({
         name: gameName,
-        playerName,
-        minPlayers: MIN_PLAYERS,
-        maxPlayers: MAX_PLAYERS,
-        initialState: { tiles: Array<number | null>(9).fill(null) },
-        reduceEvent(state, event, player) {
+        participantName: playerName,
+        participantMetadata: null,
+        createInitialState() {
+          return { tiles: Array<number | null>(9).fill(null) };
+        },
+        getLobbyMetadata(participants) {
+          return {
+            playerCount: participants.length,
+            minPlayers: MIN_PLAYERS,
+            maxPlayers: MAX_PLAYERS,
+          };
+        },
+        validateJoin(candidate, participants) {
+          if (participants.some((participant) => participant.name.toLowerCase() === candidate.name.toLowerCase())) {
+            return 'That participant name is already in use';
+          }
+          return participants.length >= MAX_PLAYERS ? 'The game is full' : null;
+        },
+        validateStart(participants) {
+          return participants.length < MIN_PLAYERS
+            ? `At least ${MIN_PLAYERS} participants are required to start the game`
+            : null;
+        },
+        reduceEvent(state, event, participant) {
           if (event.type !== 'claimTile' || !Number.isInteger(event.tile) || event.tile < 0 || event.tile > 8) {
             return state;
           }
           const tiles = [...state.tiles];
-          tiles[event.tile] = player.slot;
+          tiles[event.tile] = participant.slot;
           return { tiles };
         },
       });
@@ -87,12 +123,16 @@ export default function App() {
     }
   }
 
-  async function joinGame(service: DiscoveredGame) {
+  async function joinGame(service: DiscoveredGame<TileLobbyMetadata>) {
     const attempt = ++joinAttempt.current;
     setBusy(true);
     setError(null);
     try {
-      const nextSession = await multiplayer.joinGame<TileState, TileEvent>({ service, playerName });
+      const nextSession = await multiplayer.joinGame<TileState, TileEvent>({
+        service,
+        participantName: playerName,
+        participantMetadata: null,
+      });
       if (attempt !== joinAttempt.current) {
         await nextSession.leaveGame();
         return;
@@ -250,9 +290,9 @@ function Home(props: {
 }
 
 function Games(props: {
-  games: DiscoveredGame[];
+  games: DiscoveredGame<TileLobbyMetadata>[];
   busy: boolean;
-  onJoin(game: DiscoveredGame): void;
+  onJoin(game: DiscoveredGame<TileLobbyMetadata>): void;
   onRefresh(): void;
   onBack(): void;
 }) {
@@ -263,7 +303,7 @@ function Games(props: {
       {props.games.length === 0 ? (
         <View style={styles.empty}><ActivityIndicator color="#36C5A3" /><Text style={styles.emptyText}>Waiting for a host</Text></View>
       ) : props.games.map((game) => {
-        const full = game.lobby.playerCount >= game.lobby.maxPlayers;
+        const full = game.lobbyMetadata.playerCount >= game.lobbyMetadata.maxPlayers;
         return (
           <Pressable
             key={game.serviceId}
@@ -274,7 +314,7 @@ function Games(props: {
             <View style={styles.gameInfo}>
               <Text style={styles.gameName}>{game.name}</Text>
               <Text style={styles.gameType}>
-                {game.lobby.playerCount}/{game.lobby.maxPlayers} PLAYERS · MIN {game.lobby.minPlayers}
+                {game.lobbyMetadata.playerCount}/{game.lobbyMetadata.maxPlayers} PLAYERS · MIN {game.lobbyMetadata.minPlayers}
               </Text>
             </View>
             <Text style={[styles.join, full && styles.full]}>{full ? 'FULL' : 'JOIN'}</Text>
@@ -288,14 +328,14 @@ function Games(props: {
 }
 
 function Lobby(props: {
-  snapshot: SessionSnapshot<TileState>;
+  snapshot: TileSnapshot;
   busy: boolean;
   onStart(): void;
   onLeave(): void;
 }) {
   const isHost = props.snapshot.role === 'host';
   const isClosed = props.snapshot.status === 'disconnected';
-  const lobby = props.snapshot.lobby;
+  const lobby = props.snapshot.lobbyMetadata;
   const hasMinimumPlayers = !lobby || lobby.playerCount >= lobby.minPlayers;
   return (
     <View style={styles.card}>
@@ -336,7 +376,7 @@ function Lobby(props: {
 }
 
 function Board(props: {
-  snapshot: SessionSnapshot<TileState>;
+  snapshot: TileSnapshot;
   busy: boolean;
   onClaim(tile: number): void;
   onLeave(): void;
@@ -374,13 +414,13 @@ function Board(props: {
   );
 }
 
-function PlayerList(props: { snapshot: SessionSnapshot<TileState> }) {
+function PlayerList(props: { snapshot: TileSnapshot }) {
   return (
     <View style={styles.players}>
-      {props.snapshot.players.map((player) => (
-        <View key={player.id} style={styles.player}>
-          <View style={[styles.playerDot, { backgroundColor: colorForSlot(player.slot) }]} />
-          <Text style={styles.playerName}>{player.name}{player.id === props.snapshot.self?.id ? ' (you)' : ''}</Text>
+      {props.snapshot.participants.map((participant) => (
+        <View key={participant.id} style={styles.player}>
+          <View style={[styles.playerDot, { backgroundColor: colorForSlot(participant.slot) }]} />
+          <Text style={styles.playerName}>{participant.name}{participant.id === props.snapshot.self?.id ? ' (you)' : ''}</Text>
         </View>
       ))}
     </View>

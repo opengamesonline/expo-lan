@@ -8,22 +8,36 @@ Native LAN multiplayer transport and host-authoritative sessions for Expo applic
 - On iOS, the socket package uses `NWListener`, `NWBrowser`, and `NWConnection` from Network.framework.
 - `@opengamesonline/expo-lan-multiplayer` adds message framing and host-authoritative TypeScript game sessions.
 
-The MVP supports one advertised server, one discovery operation, configurable minimum and maximum player counts, multiple clients, create/join/leave flows, and generic game events.
+The MVP supports one advertised server, one discovery operation, multiple clients, app-defined participant and lobby metadata, create/join/leave flows, and generic game events.
 
-While the game browser is open, the multiplayer package maintains one idle watcher TCP connection to each available lobby. Watchers are not players and send no periodic traffic. They receive live lobby occupancy and capacity changes so applications can show player counts before joining. Starting or cancelling a game closes its watcher connections, removing the listing immediately without waiting for Bonjour/NSD cache expiry.
+While the game browser is open, the multiplayer package maintains one idle watcher TCP connection to each available lobby. Watchers are not session participants and send no periodic traffic. They receive live, opaque lobby metadata so applications can show their own occupancy and capacity model before joining. Starting or cancelling a game closes its watcher connections, removing the listing immediately without waiting for Bonjour/NSD cache expiry.
 
 The iOS app must declare `NSLocalNetworkUsageDescription` and list `_expo-lan-game._tcp` in `NSBonjourServices`. The example app includes both declarations in `app.json`.
+
+## Generic Lobby Policy
+
+`@opengamesonline/expo-lan-multiplayer` owns network authority and host/client session roles, but it does not assign game-specific roles or capacity rules. Applications provide JSON-safe participant metadata and opaque lobby metadata when creating a typed `LanMultiplayer` instance.
+
+`createGame` accepts application callbacks that:
+
+- validate a candidate against the current participant roster with `validateJoin`;
+- validate the finalized roster before starting with `validateStart`;
+- create authoritative state at start time with `createInitialState`;
+- derive discovery metadata after each roster change with `getLobbyMetadata`; and
+- reduce an event with the connection-bound participant identity and metadata.
+
+The host is always the network authority but may have any application-defined participant metadata. For example, a card game can mark the host as a spectator, exclude that participant from its player roster in `createInitialState`, and reject spectator commands in `reduceEvent`. The multiplayer package transports those values without interpreting role names, player limits, turn order, or game rules.
 
 ## Current Limitations
 
 - Sessions are foreground-only. Backgrounding the app, switching apps, or locking the device may suspend networking and JavaScript execution. Connections might survive briefly, but background hosting and gameplay are not supported.
 - Sessions do not reconnect or resume after a connection is lost. Returning an app to the foreground does not automatically restore its previous session or synchronize missed state.
 - Host migration is not supported. If the host leaves, disconnects, or is suspended, the session ends for every client.
-- Traffic is not authenticated or encrypted. Player identity is session-local, and the host is trusted as the authority. Use the packages only on trusted local networks unless the application adds its own security layer.
+- Traffic is not authenticated or encrypted. Participant identity is session-local, and the host is trusted as the authority. Use the packages only on trusted local networks unless the application adds its own security layer.
 - Discovery and connections are LAN-only. There is no internet matchmaking, relay service, NAT traversal, or support for routers that block multicast DNS or isolate Wi-Fi clients.
 - The native socket module supports one advertised server and one discovery operation at a time. A `LanMultiplayer` instance supports one active game session at a time.
-- Native transport capacity is limited to 32 simultaneous connections. Game-browser watcher connections count toward this limit alongside joined players.
-- Game event payloads are application-defined. TypeScript types are not runtime validation; hosts must validate untrusted event contents in their reducers before applying state changes.
+- Native transport capacity is limited to 32 simultaneous connections. Game-browser watcher connections count toward this limit alongside joined participants.
+- Participant metadata, lobby metadata, and game event payloads are application-defined. TypeScript types are not runtime validation; hosts must validate untrusted metadata and events in their policy callbacks and reducers.
 - The packages require a native development or production build and do not run in Expo Go or on the web.
 - Bonjour and NSD timing depends on the platform and network. The example includes a manual **Refresh** action because Android emulators can delay discovering a game created after browsing has already started.
 - Emulator networking does not fully represent a physical LAN. The development bridge supports Android-emulator hosts connecting to an iOS Simulator, but it is test tooling rather than production functionality.
@@ -171,7 +185,7 @@ cd ../expo-lan-sockets/@opengamesonline/expo-lan-sockets-example
 npm run check
 ```
 
-The multiplayer tests use an injected in-memory socket transport and cover lobby creation and joining, minimum and maximum capacity, live browser occupancy, host-only game start, client start notifications, authoritative tile synchronization, leaving, disconnects, late joins, and fragmented TCP frames.
+The multiplayer tests use an injected in-memory socket transport and cover generic participant metadata, app-defined join and start policy, finalized-roster state initialization, live opaque lobby metadata, host-only game start, authoritative event identity, leaving, disconnects, late joins, and fragmented TCP frames.
 
 With at least one Android emulator or device connected, run the native loopback integration suite from the example app:
 

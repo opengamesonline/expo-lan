@@ -10,6 +10,16 @@ export type SessionRole = 'host' | 'client';
 export type SessionStatus = 'connecting' | 'connected' | 'disconnected' | 'left';
 export type GamePhase = 'lobby' | 'started';
 
+export type LobbyInfo = {
+  playerCount: number;
+  minPlayers: number;
+  maxPlayers: number;
+};
+
+export type DiscoveredGame = DiscoveredService & {
+  lobby: LobbyInfo;
+};
+
 export type SessionSnapshot<State> = {
   role: SessionRole;
   status: SessionStatus;
@@ -18,6 +28,7 @@ export type SessionSnapshot<State> = {
   revision: number;
   self: Player | null;
   players: Player[];
+  lobby: LobbyInfo | null;
   error: string | null;
 };
 
@@ -25,15 +36,16 @@ export type CreateGameOptions<State, GameEvent> = {
   name: string;
   playerName: string;
   initialState: State;
+  minPlayers?: number;
   maxPlayers?: number;
   reduceEvent(state: State, event: GameEvent, player: Player): State;
 };
 
 export type JoinGameOptions = {
-  service: DiscoveredService;
+  service: DiscoveredGame;
   playerName: string;
 };
 
-export type GamesListener = (games: DiscoveredService[]) => void;
+export type GamesListener = (games: DiscoveredGame[]) => void;
 export type SessionListener<State> = (snapshot: SessionSnapshot<State>) => void;
 export type MultiplayerError = LanSocketsErrorEvent;

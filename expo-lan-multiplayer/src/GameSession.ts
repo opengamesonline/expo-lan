@@ -3,6 +3,7 @@ import type { SessionTransport } from './SessionTransport';
 import type {
   CreateGameOptions,
   GamePhase,
+  LobbyInfo,
   Player,
   SessionListener,
   SessionRole,
@@ -27,6 +28,8 @@ export class GameSession<State, GameEvent> {
   private revision = 0;
   private self: Player | null;
   private players: Player[];
+  private minPlayers: number | null;
+  private maxPlayers: number | null;
   private error: string | null = null;
 
   private constructor(
@@ -40,6 +43,9 @@ export class GameSession<State, GameEvent> {
     this.status = role === 'host' ? 'connected' : 'connecting';
     this.self = role === 'host' ? createPlayer(hostOptions?.playerName ?? 'Host', 0) : null;
     this.players = this.self ? [this.self] : [];
+    const limits = hostOptions ? lobbyLimits(hostOptions) : null;
+    this.minPlayers = limits?.minPlayers ?? null;
+    this.maxPlayers = limits?.maxPlayers ?? null;
   }
 
   static host<State, GameEvent>(
@@ -66,6 +72,7 @@ export class GameSession<State, GameEvent> {
       revision: this.revision,
       self: this.self,
       players: [...this.players],
+      lobby: this.lobbyInfo(),
       error: this.error,
     };
   }
@@ -91,6 +98,10 @@ export class GameSession<State, GameEvent> {
     if (this.status !== 'connected') throw new Error('The game session is not connected');
     if (this.phase === 'started') return;
     if (this.state === null) throw new Error('The game state is not ready');
+    const lobby = this.lobbyInfo();
+    if (lobby && lobby.playerCount < lobby.minPlayers) {
+      throw new Error(`At least ${lobby.minPlayers} players are required to start the game`);
+    }
     this.phase = 'started';
     this.emit();
     await Promise.all([
@@ -216,6 +227,8 @@ export class GameSession<State, GameEvent> {
       this.state = message.state;
       this.revision = message.revision;
       this.phase = message.phase;
+      this.minPlayers = message.lobby.minPlayers;
+      this.maxPlayers = message.lobby.maxPlayers;
       this.status = 'connected';
       this.emit();
     } else if (message.kind === 'playerJoined') {
@@ -247,7 +260,7 @@ export class GameSession<State, GameEvent> {
       await this.transport.disconnectAsync(connectionId);
       return;
     }
-    const maxPlayers = this.hostOptions?.maxPlayers ?? 8;
+    const maxPlayers = this.maxPlayers ?? 8;
     if (this.players.length >= maxPlayers) {
       await this.send(connectionId, { v: PROTOCOL_VERSION, kind: 'rejected', reason: 'The game is full' });
       await this.transport.disconnectAsync(connectionId);
@@ -269,8 +282,12 @@ export class GameSession<State, GameEvent> {
       state: this.state,
       revision: this.revision,
       phase: this.phase,
+      lobby: requireLobbyInfo(this.lobbyInfo()),
     });
-    await this.broadcast({ v: PROTOCOL_VERSION, kind: 'playerJoined', player }, connectionId);
+    await Promise.all([
+      this.broadcast({ v: PROTOCOL_VERSION, kind: 'playerJoined', player }, connectionId),
+      this.notifyWatchers(),
+    ]);
     this.emit();
   }
 
@@ -278,7 +295,10 @@ export class GameSession<State, GameEvent> {
     const player = this.forgetPlayer(connectionId);
     if (!player) return;
     if (this.status === 'left') return;
-    await this.broadcastBestEffort({ v: PROTOCOL_VERSION, kind: 'playerLeft', playerId: player.id });
+    await Promise.all([
+      this.broadcastBestEffort({ v: PROTOCOL_VERSION, kind: 'playerLeft', playerId: player.id }),
+      this.notifyWatchers(),
+    ]);
     this.emit();
   }
 
@@ -299,6 +319,7 @@ export class GameSession<State, GameEvent> {
         v: PROTOCOL_VERSION,
         kind: 'watching',
         phase: this.phase,
+        lobby: requireLobbyInfo(this.lobbyInfo()),
       });
       if (this.phase !== 'lobby' || this.status !== 'connected') {
         this.watcherConnections.delete(connectionId);
@@ -316,6 +337,27 @@ export class GameSession<State, GameEvent> {
     await Promise.allSettled(
       connectionIds.map((connectionId) => this.transport.disconnectAsync(connectionId))
     );
+  }
+
+  private async notifyWatchers(): Promise<void> {
+    const message: WireMessage<State, GameEvent> = {
+      v: PROTOCOL_VERSION,
+      kind: 'watching',
+      phase: this.phase,
+      lobby: requireLobbyInfo(this.lobbyInfo()),
+    };
+    await Promise.allSettled(
+      [...this.watcherConnections].map((connectionId) => this.send(connectionId, message))
+    );
+  }
+
+  private lobbyInfo(): LobbyInfo | null {
+    if (this.minPlayers === null || this.maxPlayers === null) return null;
+    return {
+      playerCount: this.players.length,
+      minPlayers: this.minPlayers,
+      maxPlayers: this.maxPlayers,
+    };
   }
 
   private async applyEvent(event: GameEvent, player: Player): Promise<void> {
@@ -371,4 +413,23 @@ function createPlayer(name: string, slot: number): Player {
 
 function cleanName(name: string): string {
   return name.trim().slice(0, 24) || 'Player';
+}
+
+function lobbyLimits<State, GameEvent>(
+  options: CreateGameOptions<State, GameEvent>
+): Pick<LobbyInfo, 'minPlayers' | 'maxPlayers'> {
+  const minPlayers = options.minPlayers ?? 1;
+  const maxPlayers = options.maxPlayers ?? 8;
+  if (!Number.isInteger(minPlayers) || minPlayers < 1) {
+    throw new Error('Minimum players must be a positive integer');
+  }
+  if (!Number.isInteger(maxPlayers) || maxPlayers < minPlayers || maxPlayers > 32) {
+    throw new Error('Maximum players must be an integer between the minimum and 32');
+  }
+  return { minPlayers, maxPlayers };
+}
+
+function requireLobbyInfo(lobby: LobbyInfo | null): LobbyInfo {
+  if (!lobby) throw new Error('Lobby capacity is not available');
+  return lobby;
 }

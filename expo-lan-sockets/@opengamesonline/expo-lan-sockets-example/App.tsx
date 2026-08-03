@@ -10,8 +10,8 @@ import {
   TextInput,
   View,
 } from 'react-native';
-import type { DiscoveredService } from '@opengamesonline/expo-lan-sockets';
 import {
+  type DiscoveredGame,
   GameSession,
   LanMultiplayer,
   type SessionSnapshot,
@@ -22,13 +22,15 @@ type TileEvent = { type: 'claimTile'; tile: number };
 type Screen = 'home' | 'games' | 'session';
 
 const PLAYER_COLORS = ['#F05D5E', '#36C5A3', '#F4B942', '#6C8CFF', '#C77DFF', '#FF8C42'];
+const MIN_PLAYERS = 2;
+const MAX_PLAYERS = PLAYER_COLORS.length;
 const multiplayer = new LanMultiplayer();
 
 export default function App() {
   const [screen, setScreen] = useState<Screen>('home');
   const [playerName, setPlayerName] = useState('Player');
   const [gameName, setGameName] = useState('Tile Clash');
-  const [games, setGames] = useState<DiscoveredService[]>([]);
+  const [games, setGames] = useState<DiscoveredGame[]>([]);
   const [session, setSession] = useState<GameSession<TileState, TileEvent> | null>(null);
   const [snapshot, setSnapshot] = useState<SessionSnapshot<TileState> | null>(null);
   const [busy, setBusy] = useState(false);
@@ -52,7 +54,8 @@ export default function App() {
       const nextSession = await multiplayer.createGame<TileState, TileEvent>({
         name: gameName,
         playerName,
-        maxPlayers: PLAYER_COLORS.length,
+        minPlayers: MIN_PLAYERS,
+        maxPlayers: MAX_PLAYERS,
         initialState: { tiles: Array<number | null>(9).fill(null) },
         reduceEvent(state, event, player) {
           if (event.type !== 'claimTile' || !Number.isInteger(event.tile) || event.tile < 0 || event.tile > 8) {
@@ -84,7 +87,7 @@ export default function App() {
     }
   }
 
-  async function joinGame(service: DiscoveredService) {
+  async function joinGame(service: DiscoveredGame) {
     const attempt = ++joinAttempt.current;
     setBusy(true);
     setError(null);
@@ -247,9 +250,9 @@ function Home(props: {
 }
 
 function Games(props: {
-  games: DiscoveredService[];
+  games: DiscoveredGame[];
   busy: boolean;
-  onJoin(game: DiscoveredService): void;
+  onJoin(game: DiscoveredGame): void;
   onRefresh(): void;
   onBack(): void;
 }) {
@@ -259,12 +262,25 @@ function Games(props: {
       <Text style={styles.body}>Searching the local network...</Text>
       {props.games.length === 0 ? (
         <View style={styles.empty}><ActivityIndicator color="#36C5A3" /><Text style={styles.emptyText}>Waiting for a host</Text></View>
-      ) : props.games.map((game) => (
-        <Pressable key={game.serviceId} style={styles.gameRow} disabled={props.busy} onPress={() => props.onJoin(game)}>
-          <View style={styles.gameInfo}><Text style={styles.gameName}>{game.name}</Text><Text style={styles.gameType}>LAN GAME</Text></View>
-          <Text style={styles.join}>JOIN</Text>
-        </Pressable>
-      ))}
+      ) : props.games.map((game) => {
+        const full = game.lobby.playerCount >= game.lobby.maxPlayers;
+        return (
+          <Pressable
+            key={game.serviceId}
+            style={styles.gameRow}
+            disabled={props.busy || full}
+            onPress={() => props.onJoin(game)}
+          >
+            <View style={styles.gameInfo}>
+              <Text style={styles.gameName}>{game.name}</Text>
+              <Text style={styles.gameType}>
+                {game.lobby.playerCount}/{game.lobby.maxPlayers} PLAYERS · MIN {game.lobby.minPlayers}
+              </Text>
+            </View>
+            <Text style={[styles.join, full && styles.full]}>{full ? 'FULL' : 'JOIN'}</Text>
+          </Pressable>
+        );
+      })}
       <ActionButton label="Refresh" disabled={props.busy} onPress={props.onRefresh} />
       <ActionButton label="Back" disabled={props.busy} onPress={props.onBack} />
     </View>
@@ -279,6 +295,8 @@ function Lobby(props: {
 }) {
   const isHost = props.snapshot.role === 'host';
   const isClosed = props.snapshot.status === 'disconnected';
+  const lobby = props.snapshot.lobby;
+  const hasMinimumPlayers = !lobby || lobby.playerCount >= lobby.minPlayers;
   return (
     <View style={styles.card}>
       <Text style={styles.eyebrow}>GAME LOBBY</Text>
@@ -292,9 +310,19 @@ function Lobby(props: {
           ? 'Players can join while this lobby is open. Start the game when everyone is here.'
           : 'You are connected. The board will open when the host starts the game.'}
       </Text>
+      {lobby ? (
+        <Text style={styles.capacity}>
+          {lobby.playerCount}/{lobby.maxPlayers} players · {hasMinimumPlayers ? 'Ready to start' : `Need ${lobby.minPlayers} to start`}
+        </Text>
+      ) : null}
       <PlayerList snapshot={props.snapshot} />
       {isClosed ? null : isHost ? (
-        <ActionButton label="Start game" primary disabled={props.busy} onPress={props.onStart} />
+        <ActionButton
+          label="Start game"
+          primary
+          disabled={props.busy || !hasMinimumPlayers}
+          onPress={props.onStart}
+        />
       ) : (
         <View style={styles.waiting}><ActivityIndicator color="#36C5A3" /><Text style={styles.emptyText}>Host controls the start</Text></View>
       )}
@@ -416,6 +444,8 @@ const styles = StyleSheet.create({
   gameName: { color: '#F5F3EE', fontSize: 17, fontWeight: '800' },
   gameType: { color: '#6F7184', fontSize: 9, fontWeight: '800', letterSpacing: 1.3, marginTop: 4 },
   join: { flexShrink: 0, color: '#36C5A3', fontSize: 12, fontWeight: '900', letterSpacing: 1.2 },
+  full: { color: '#8D90A5' },
+  capacity: { color: '#F4B942', fontSize: 12, fontWeight: '800', marginTop: -12 },
   sessionHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
   status: { color: '#8D90A5', fontSize: 10, fontWeight: '800', letterSpacing: 1.1, marginTop: 7 },
   selfColor: { width: 34, height: 34, borderRadius: 11, borderWidth: 3, borderColor: '#F5F3EE' },

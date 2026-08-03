@@ -92,13 +92,14 @@ class ClientTransport implements SessionTransport {
   }
 }
 
-function createHost() {
+function createHost(capacity: { minPlayers?: number; maxPlayers?: number } = {}) {
   const owner = new SessionOwner();
   const transport = new HostTransport();
   const session = GameSession.host<TileState, TileEvent>(owner, transport, {
     name: 'Test game',
     playerName: 'Host',
     initialState: { tiles: Array<number | null>(9).fill(null) },
+    ...capacity,
     reduceEvent(state, event, player) {
       const tiles = [...state.tiles];
       if (event.type === 'claimTile' && event.tile >= 0 && event.tile < tiles.length) {
@@ -159,6 +160,30 @@ test('only the host can start and clients receive the transition', async () => {
   assert.equal(client.session.snapshot.phase, 'started');
 });
 
+test('enforces minimum and maximum lobby capacity', async () => {
+  const host = createHost({ minPlayers: 2, maxPlayers: 2 });
+
+  assert.deepEqual(host.session.snapshot.lobby, {
+    playerCount: 1,
+    minPlayers: 2,
+    maxPlayers: 2,
+  });
+  await assert.rejects(host.session.startGame(), /At least 2 players/);
+
+  const client = await joinClient(host, 1);
+  assert.equal(client.session.snapshot.status, 'connected');
+  assert.deepEqual(client.session.snapshot.lobby, {
+    playerCount: 2,
+    minPlayers: 2,
+    maxPlayers: 2,
+  });
+
+  const rejectedClient = await joinClient(host, 2);
+  assert.equal(rejectedClient.session.snapshot.status, 'disconnected');
+  assert.equal(host.session.snapshot.players.length, 2);
+  await host.session.startGame();
+});
+
 test('synchronizes an authoritative tile update', async () => {
   const host = createHost();
   const client = await joinClient(host);
@@ -202,13 +227,41 @@ test('keeps watchers out of the player list and closes them when the game starts
   const host = createHost();
   const watcher = await watchHost(host);
 
-  assert.deepEqual(watcher.messages, [{ v: 1, kind: 'watching', phase: 'lobby' }]);
+  assert.deepEqual(watcher.messages, [
+    {
+      v: 1,
+      kind: 'watching',
+      phase: 'lobby',
+      lobby: { playerCount: 1, minPlayers: 1, maxPlayers: 8 },
+    },
+  ]);
   assert.deepEqual(host.session.snapshot.players.map((player) => player.name), ['Host']);
 
   await host.session.startGame();
   await settle();
 
   assert.equal(watcher.disconnectedFromHost, true);
+});
+
+test('updates watchers when lobby occupancy changes', async () => {
+  const host = createHost({ minPlayers: 2, maxPlayers: 4 });
+  const watcher = await watchHost(host);
+  const client = await joinClient(host);
+
+  assert.deepEqual(watcher.messages.map((message) => message.kind === 'watching' && message.lobby), [
+    { playerCount: 1, minPlayers: 2, maxPlayers: 4 },
+    { playerCount: 2, minPlayers: 2, maxPlayers: 4 },
+  ]);
+
+  await client.session.leaveGame();
+  await settle();
+
+  assert.deepEqual(watcher.messages.at(-1), {
+    v: 1,
+    kind: 'watching',
+    phase: 'lobby',
+    lobby: { playerCount: 1, minPlayers: 2, maxPlayers: 4 },
+  });
 });
 
 test('closes watcher connections when the host cancels the game', async () => {

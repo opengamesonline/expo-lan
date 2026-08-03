@@ -13,7 +13,13 @@ import {
   SERVICE_TYPE,
   WATCH_ACK_TIMEOUT_MS,
 } from './protocol';
-import type { CreateGameOptions, GamesListener, JoinGameOptions } from './types';
+import type {
+  CreateGameOptions,
+  DiscoveredGame,
+  GamesListener,
+  JoinGameOptions,
+  LobbyInfo,
+} from './types';
 
 type Subscription = { remove(): void };
 type GameWatch = {
@@ -28,6 +34,7 @@ const CONNECT_RETRY_DELAY_MS = 500;
 
 export class LanMultiplayer {
   private readonly games = new Map<string, DiscoveredService>();
+  private readonly gameLobbies = new Map<string, LobbyInfo>();
   private readonly serviceHosts = new Map<string, string>();
   private readonly gamesListeners = new Set<GamesListener>();
   private readonly gameWatches = new Map<string, GameWatch>();
@@ -47,10 +54,11 @@ export class LanMultiplayer {
       ExpoLanSockets.addListener('onServiceFound', (service) => {
         const advertised = parseAdvertisedName(service.name);
         let game: DiscoveredService;
+        let removedVisibleGame = false;
         if (advertised) {
           for (const [serviceId, hostId] of this.serviceHosts) {
             if (hostId === advertised.hostId && serviceId !== service.serviceId) {
-              this.removeGame(serviceId);
+              removedVisibleGame = this.removeGame(serviceId) || removedVisibleGame;
             }
           }
           this.serviceHosts.set(service.serviceId, advertised.hostId);
@@ -59,7 +67,7 @@ export class LanMultiplayer {
           game = service;
         }
         this.games.set(service.serviceId, game);
-        this.emitGames();
+        if (removedVisibleGame) this.emitGames();
         if (this.discovering) void this.startWatchingGame(service);
       }),
       ExpoLanSockets.addListener('onServiceLost', ({ serviceId }) => {
@@ -110,6 +118,7 @@ export class LanMultiplayer {
     this.discovering = false;
     this.watchGeneration += 1;
     this.games.clear();
+    this.gameLobbies.clear();
     this.serviceHosts.clear();
     this.emitGames();
     const operation = Promise.all([
@@ -195,8 +204,13 @@ export class LanMultiplayer {
     if (this.activeSession) throw new Error('Leave the current game before starting another one');
   }
 
-  private gameList(): DiscoveredService[] {
-    return [...this.games.values()].sort((left, right) => left.name.localeCompare(right.name));
+  private gameList(): DiscoveredGame[] {
+    return [...this.games.values()]
+      .flatMap((game) => {
+        const lobby = this.gameLobbies.get(game.serviceId);
+        return lobby ? [{ ...game, lobby }] : [];
+      })
+      .sort((left, right) => left.name.localeCompare(right.name));
   }
 
   private emitGames(): void {
@@ -268,7 +282,13 @@ export class LanMultiplayer {
           this.removeUnavailableGame(serviceId);
           return true;
         }
+        if (!isLobbyInfo(message.lobby)) {
+          this.removeUnavailableGame(serviceId);
+          return true;
+        }
         clearTimeout(watch.timeout);
+        this.gameLobbies.set(serviceId, message.lobby);
+        this.emitGames();
       }
     } catch {
       this.removeUnavailableGame(serviceId);
@@ -285,15 +305,18 @@ export class LanMultiplayer {
       this.gameWatches.delete(serviceId);
     }
     this.watchConnections.delete(connectionId);
-    if (this.discovering && this.games.delete(serviceId)) {
-      this.serviceHosts.delete(serviceId);
+    const wasVisible = this.gameLobbies.delete(serviceId);
+    this.games.delete(serviceId);
+    this.serviceHosts.delete(serviceId);
+    if (this.discovering && wasVisible) {
       this.emitGames();
     }
     return true;
   }
 
   private removeGame(serviceId: string): boolean {
-    const removed = this.games.delete(serviceId);
+    const removed = this.gameLobbies.delete(serviceId);
+    this.games.delete(serviceId);
     this.serviceHosts.delete(serviceId);
     const watch = this.gameWatches.get(serviceId);
     if (watch) {
@@ -355,4 +378,18 @@ function parseAdvertisedName(name: string): { name: string; hostId: string } | n
 
 function delay(milliseconds: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+function isLobbyInfo(value: unknown): value is LobbyInfo {
+  if (typeof value !== 'object' || value === null) return false;
+  const lobby = value as Partial<LobbyInfo>;
+  return (
+    Number.isInteger(lobby.playerCount) &&
+    Number.isInteger(lobby.minPlayers) &&
+    Number.isInteger(lobby.maxPlayers) &&
+    (lobby.playerCount ?? 0) >= 1 &&
+    (lobby.minPlayers ?? 0) >= 1 &&
+    (lobby.minPlayers ?? 0) <= (lobby.maxPlayers ?? 0) &&
+    (lobby.playerCount ?? 0) <= (lobby.maxPlayers ?? 0)
+  );
 }

@@ -25,10 +25,22 @@ test('decodes multiple messages from one TCP read', () => {
 test('frames watcher registration and acknowledgement messages', () => {
   const decoder = new MessageDecoder();
   const watch = encodeMessage({ v: 1, kind: 'watch' });
-  const watching = encodeMessage({ v: 1, kind: 'watching', phase: 'lobby' });
+  const watching = encodeMessage({
+    v: 1,
+    kind: 'watching',
+    phase: 'lobby',
+    lobby: { playerCount: 1, minPlayers: 2, maxPlayers: 6 },
+  });
 
   assert.deepEqual(decoder.push(watch), [{ v: 1, kind: 'watch' }]);
-  assert.deepEqual(decoder.push(watching), [{ v: 1, kind: 'watching', phase: 'lobby' }]);
+  assert.deepEqual(decoder.push(watching), [
+    {
+      v: 1,
+      kind: 'watching',
+      phase: 'lobby',
+      lobby: { playerCount: 1, minPlayers: 2, maxPlayers: 6 },
+    },
+  ]);
 });
 
 test('rejects unsupported protocol versions', () => {

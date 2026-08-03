@@ -8,9 +8,9 @@ Native LAN multiplayer transport and host-authoritative sessions for Expo applic
 - On iOS, the socket package uses `NWListener`, `NWBrowser`, and `NWConnection` from Network.framework.
 - `@opengamesonline/expo-lan-multiplayer` adds message framing and host-authoritative TypeScript game sessions.
 
-The MVP supports one advertised server, one discovery operation, multiple clients, create/join/leave flows, and generic game events.
+The MVP supports one advertised server, one discovery operation, configurable minimum and maximum player counts, multiple clients, create/join/leave flows, and generic game events.
 
-While the game browser is open, the multiplayer package maintains one idle watcher TCP connection to each available lobby. Watchers are not players and send no periodic traffic. Starting or cancelling a game closes its watcher connections, removing the listing immediately without waiting for Bonjour/NSD cache expiry.
+While the game browser is open, the multiplayer package maintains one idle watcher TCP connection to each available lobby. Watchers are not players and send no periodic traffic. They receive live lobby occupancy and capacity changes so applications can show player counts before joining. Starting or cancelling a game closes its watcher connections, removing the listing immediately without waiting for Bonjour/NSD cache expiry.
 
 The iOS app must declare `NSLocalNetworkUsageDescription` and list `_expo-lan-game._tcp` in `NSBonjourServices`. The example app includes both declarations in `app.json`.
 
@@ -171,7 +171,7 @@ cd ../expo-lan-sockets/@opengamesonline/expo-lan-sockets-example
 npm run check
 ```
 
-The multiplayer tests use an injected in-memory socket transport and cover lobby creation and joining, host-only game start, client start notifications, authoritative tile synchronization, leaving, disconnects, late joins, and fragmented TCP frames.
+The multiplayer tests use an injected in-memory socket transport and cover lobby creation and joining, minimum and maximum capacity, live browser occupancy, host-only game start, client start notifications, authoritative tile synchronization, leaving, disconnects, late joins, and fragmented TCP frames.
 
 With at least one Android emulator or device connected, run the native loopback integration suite from the example app:
 
@@ -186,7 +186,7 @@ The Android suite exercises server restart, client connect and disconnect, bidir
 1. Open the app on both targets.
 2. Choose **Create game** on the first target.
 3. Choose **Find games** on the second target.
-4. Join the advertised game and confirm both players appear in the lobby.
+4. Confirm the advertised player count and capacity, join the game, and verify both players appear in the lobby.
 5. Choose **Start game** on the host.
 6. Press tiles from both devices and confirm that both boards update.
 7. Leave the game and confirm the player is removed.

@@ -1,4 +1,4 @@
-import type { GamePhase, Player } from './types';
+import type { GamePhase, LobbyInfo, Player } from './types';
 
 export const PROTOCOL_VERSION = 1;
 export const SERVICE_TYPE = '_expo-lan-game._tcp.';
@@ -7,9 +7,9 @@ export const WATCH_ACK_TIMEOUT_MS = 2000;
 
 export type WireMessage<State, GameEvent> =
   | { v: 1; kind: 'watch' }
-  | { v: 1; kind: 'watching'; phase: GamePhase }
+  | { v: 1; kind: 'watching'; phase: GamePhase; lobby: LobbyInfo }
   | { v: 1; kind: 'join'; playerName: string }
-  | { v: 1; kind: 'welcome'; self: Player; players: Player[]; state: State; revision: number; phase: GamePhase }
+  | { v: 1; kind: 'welcome'; self: Player; players: Player[]; state: State; revision: number; phase: GamePhase; lobby: LobbyInfo }
   | { v: 1; kind: 'playerJoined'; player: Player }
   | { v: 1; kind: 'playerLeft'; playerId: string }
   | { v: 1; kind: 'gameStarted'; state: State; revision: number }

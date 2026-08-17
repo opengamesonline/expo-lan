@@ -19,6 +19,7 @@ import type {
   GamesListener,
   JoinGameOptions,
   JsonValue,
+  RecoverGameOptions,
 } from './types';
 
 type Subscription = { remove(): void };
@@ -34,6 +35,17 @@ type GameWatch<
 const SERVICE_ID_LENGTH = 6;
 const CONNECT_ATTEMPTS = 3;
 const CONNECT_RETRY_DELAY_MS = 500;
+const RECOVERY_POLL_MS = 250;
+const RECOVERY_BASE_DELAY_MS = 5_000;
+const RECOVERY_CANDIDATE_DELAY_MS = 3_000;
+const RECOVERY_TIMEOUT_MS = 45_000;
+
+type AdvertisedGame = {
+  name: string;
+  tableId: string;
+  authorityTerm: number;
+  hostRank: number;
+};
 
 export class LanMultiplayer<
   ParticipantMetadata extends JsonValue = JsonValue,
@@ -42,6 +54,8 @@ export class LanMultiplayer<
   private readonly games = new Map<string, DiscoveredService>();
   private readonly gameLobbyMetadata = new Map<string, LobbyMetadata>();
   private readonly serviceHosts = new Map<string, string>();
+  private readonly serviceAuthorities = new Map<string, AdvertisedGame>();
+  private readonly strongestObservedAuthorities = new Map<string, AdvertisedGame>();
   private readonly gamesListeners = new Set<GamesListener<LobbyMetadata>>();
   private readonly gameWatches = new Map<
     string,
@@ -50,7 +64,6 @@ export class LanMultiplayer<
   private readonly watchConnections = new Map<string, string>();
   private readonly pendingWatches = new Set<string>();
   private readonly subscriptions: Subscription[];
-  private readonly hostId = randomId();
   private activeSession: GameSession<
     unknown,
     unknown,
@@ -64,6 +77,7 @@ export class LanMultiplayer<
     LobbyMetadata
   > | null = null;
   private joinAttempt = 0;
+  private recoveryAttempt = 0;
   private discovering = false;
   private stoppingDiscovery: Promise<void> | null = null;
   private watchGeneration = 0;
@@ -75,12 +89,32 @@ export class LanMultiplayer<
         let game: DiscoveredService;
         let removedVisibleGame = false;
         if (advertised) {
-          for (const [serviceId, hostId] of this.serviceHosts) {
-            if (hostId === advertised.hostId && serviceId !== service.serviceId) {
+          const strongestObserved = this.strongestObservedAuthorities.get(advertised.tableId);
+          if (!strongestObserved || outranks(advertised, strongestObserved)) {
+            this.strongestObservedAuthorities.set(advertised.tableId, advertised);
+          }
+          const superseded = [...this.serviceAuthorities.entries()].some(
+            ([serviceId, authority]) =>
+              authority.tableId === advertised.tableId &&
+              (authority.authorityTerm > advertised.authorityTerm ||
+                (authority.authorityTerm === advertised.authorityTerm &&
+                  authority.hostRank < advertised.hostRank)) &&
+              serviceId !== service.serviceId
+          );
+          if (superseded) return;
+          for (const [serviceId, authority] of this.serviceAuthorities) {
+            if (
+              authority.tableId === advertised.tableId &&
+              (authority.authorityTerm < advertised.authorityTerm ||
+                (authority.authorityTerm === advertised.authorityTerm &&
+                  authority.hostRank >= advertised.hostRank)) &&
+              serviceId !== service.serviceId
+            ) {
               removedVisibleGame = this.removeGame(serviceId) || removedVisibleGame;
             }
           }
-          this.serviceHosts.set(service.serviceId, advertised.hostId);
+          this.serviceHosts.set(service.serviceId, advertised.tableId);
+          this.serviceAuthorities.set(service.serviceId, advertised);
           game = { ...service, name: advertised.name };
         } else {
           game = service;
@@ -104,7 +138,22 @@ export class LanMultiplayer<
         this.activeSession?.disconnected(event.connectionId);
       }),
       ExpoLanSockets.addListener('onError', (event: LanSocketsErrorEvent) => {
-        this.activeSession?.fail(event.message);
+        if (event.operation === 'discovery') {
+          this.discovering = false;
+          this.watchGeneration += 1;
+          this.recoveryAttempt += 1;
+          this.games.clear();
+          this.gameLobbyMetadata.clear();
+          this.serviceHosts.clear();
+          this.serviceAuthorities.clear();
+          this.emitGames();
+          void this.stopAllWatches();
+          this.activeSession?.fail(event.message);
+        } else if (event.operation === 'server' && this.activeSession?.role === 'host') {
+          this.activeSession.authorityLost(event.message);
+        } else {
+          this.activeSession?.fail(event.message);
+        }
       }),
     ];
   }
@@ -139,6 +188,7 @@ export class LanMultiplayer<
     this.games.clear();
     this.gameLobbyMetadata.clear();
     this.serviceHosts.clear();
+    this.serviceAuthorities.clear();
     this.emitGames();
     const operation = Promise.all([
       ExpoLanSockets.stopDiscoveryAsync(),
@@ -180,12 +230,11 @@ export class LanMultiplayer<
       LobbyMetadata
     >;
     try {
-      const name = (options.name.trim() || 'LAN Game').slice(0, 32);
-      const serviceName = `${name}~${this.hostId}~${randomId()}`;
-      await ExpoLanSockets.startServerAsync({ serviceName, serviceType: SERVICE_TYPE });
+      await this.startSessionServer(session, options.name);
       return session;
     } catch (error) {
       this.activeSession = null;
+      session.dispose();
       throw error;
     }
   }
@@ -215,8 +264,8 @@ export class LanMultiplayer<
     const attempt = ++this.joinAttempt;
     let connectionId: string | null = null;
     try {
-      const hostId = this.serviceHosts.get(options.service.serviceId);
-      const connection = await this.connectToGame(options.service, hostId, attempt);
+      const tableId = this.serviceHosts.get(options.service.serviceId);
+      const connection = await this.connectToGame(options.service, tableId, attempt);
       connectionId = connection.connectionId;
       this.assertJoinActive(attempt);
       await session.attachServer(
@@ -230,6 +279,7 @@ export class LanMultiplayer<
     } catch (error) {
       if (connectionId) await ExpoLanSockets.disconnectAsync(connectionId);
       if (this.activeSession === session) this.activeSession = null;
+      session.dispose();
       throw error;
     } finally {
       if (this.pendingJoinSession === session) this.pendingJoinSession = null;
@@ -242,6 +292,171 @@ export class LanMultiplayer<
     this.joinAttempt += 1;
     this.pendingJoinSession = null;
     if (this.activeSession === session) this.activeSession = null;
+    void session.suspendConnection().finally(() => session.dispose());
+  }
+
+  restoreGame<State, GameEvent>(
+    options: RecoverGameOptions<State, GameEvent, ParticipantMetadata, LobbyMetadata>
+  ): GameSession<State, GameEvent, ParticipantMetadata, LobbyMetadata> {
+    this.assertNoSession();
+    const session = GameSession.restore<State, GameEvent, ParticipantMetadata, LobbyMetadata>(
+      this,
+      ExpoLanSockets,
+      options.recovery,
+      options.selfParticipantId
+    );
+    this.activeSession = session as GameSession<
+      unknown,
+      unknown,
+      ParticipantMetadata,
+      LobbyMetadata
+    >;
+    return session;
+  }
+
+  async recoverGame<State, GameEvent>(
+    session: GameSession<State, GameEvent, ParticipantMetadata, LobbyMetadata>,
+    hostOptions: CreateGameOptions<State, GameEvent, ParticipantMetadata, LobbyMetadata>
+  ): Promise<'reconnected' | 'promoted'> {
+    if (this.activeSession !== session) throw new Error('The session is no longer active');
+    const snapshot = session.snapshot;
+    if (!snapshot.self || !snapshot.tableId || !snapshot.hostParticipantId) {
+      throw new Error('The session does not have recovery identity');
+    }
+
+    const operation = ++this.recoveryAttempt;
+    const currentHostIndex = snapshot.hostOrder.indexOf(snapshot.hostParticipantId);
+    const rotatedCandidates = [
+      ...snapshot.hostOrder.slice(currentHostIndex + 1),
+      ...snapshot.hostOrder.slice(0, currentHostIndex + 1),
+    ];
+    const candidatePosition = rotatedCandidates.indexOf(snapshot.self.id);
+    const promoteAfter =
+      Date.now() +
+      RECOVERY_BASE_DELAY_MS +
+      Math.max(0, candidatePosition) * RECOVERY_CANDIDATE_DELAY_MS;
+    const timeoutAt = Date.now() + RECOVERY_TIMEOUT_MS;
+    let highestObservedAuthorityTerm = Math.max(
+      snapshot.authorityTerm,
+      this.strongestObservedAuthorities.get(snapshot.tableId)?.authorityTerm ?? 0
+    );
+    session.markReconnecting();
+    await this.startDiscovery();
+
+    try {
+      while (Date.now() < timeoutAt) {
+        this.assertRecoveryActive(operation, session);
+        for (const authority of this.serviceAuthorities.values()) {
+          if (authority.tableId === snapshot.tableId) {
+            highestObservedAuthorityTerm = Math.max(
+              highestObservedAuthorityTerm,
+              authority.authorityTerm
+            );
+          }
+        }
+        highestObservedAuthorityTerm = Math.max(
+          highestObservedAuthorityTerm,
+          this.strongestObservedAuthorities.get(snapshot.tableId)?.authorityTerm ?? 0
+        );
+        const service = this.bestRecoveryService(
+          snapshot.tableId,
+          snapshot.authorityTerm,
+          snapshot.hostParticipantId,
+          snapshot.hostOrder
+        );
+        if (service) {
+          let attemptedConnectionId: string | null = null;
+          let accepted = false;
+          try {
+            const connection = await ExpoLanSockets.connectToServiceAsync(service.serviceId);
+            attemptedConnectionId = connection.connectionId;
+            this.assertRecoveryActive(operation, session);
+            if (session.role === 'host') session.demoteToClient();
+            await session.attachResumedServer(connection.connectionId);
+            await waitForConnected(
+              session,
+              8_000,
+              () => operation === this.recoveryAttempt && this.activeSession === session
+            );
+            if (this.discovering) await this.stopDiscovery();
+            this.assertRecoveryActive(operation, session);
+            accepted = true;
+            return 'reconnected';
+          } catch (error) {
+            if (session.snapshot.status === 'left') throw error;
+            this.assertRecoveryActive(operation, session);
+            this.removeGame(service.serviceId);
+            await delay(CONNECT_RETRY_DELAY_MS);
+          } finally {
+            if (attemptedConnectionId && !accepted) {
+              await ExpoLanSockets.disconnectAsync(attemptedConnectionId).catch(() => undefined);
+            }
+          }
+        }
+
+        if (candidatePosition >= 0 && Date.now() >= promoteAfter) {
+          const previousHostParticipantId = session.snapshot.hostParticipantId!;
+          const previousAuthorityTerm = session.snapshot.authorityTerm;
+          if (this.discovering) await this.stopDiscovery();
+          this.assertRecoveryActive(operation, session);
+          let promotionBegun = false;
+          try {
+            session.beginPromotion(hostOptions, highestObservedAuthorityTerm);
+            promotionBegun = true;
+            await this.startSessionServer(session, hostOptions.name);
+            this.assertRecoveryActive(operation, session);
+            session.commitPromotion();
+            return 'promoted';
+          } catch (error) {
+            if (promotionBegun) {
+              await ExpoLanSockets.stopServerAsync().catch(() => undefined);
+              session.abortPromotion(previousHostParticipantId, previousAuthorityTerm);
+            }
+            throw error;
+          }
+        }
+        await delay(RECOVERY_POLL_MS);
+      }
+      throw new Error('Could not recover the table on this network');
+    } finally {
+      if (operation === this.recoveryAttempt && this.discovering) {
+        await this.stopDiscovery().catch(() => undefined);
+      }
+    }
+  }
+
+  async suspendSession(): Promise<void> {
+    this.recoveryAttempt += 1;
+    await this.activeSession?.suspendConnection();
+  }
+
+  cancelRecovery(): void {
+    this.recoveryAttempt += 1;
+  }
+
+  async startAuthorityMonitoring(): Promise<void> {
+    await this.startDiscovery();
+  }
+
+  hasHigherAuthority<State, GameEvent>(
+    session: GameSession<State, GameEvent, ParticipantMetadata, LobbyMetadata>
+  ): boolean {
+    const snapshot = session.snapshot;
+    if (!snapshot.tableId || !snapshot.hostParticipantId) return false;
+    const currentRank = snapshot.hostOrder.indexOf(snapshot.hostParticipantId);
+    const observedAuthorities = [
+      ...this.serviceAuthorities.values(),
+      ...(this.strongestObservedAuthorities.get(snapshot.tableId)
+        ? [this.strongestObservedAuthorities.get(snapshot.tableId)!]
+        : []),
+    ];
+    return observedAuthorities.some(
+      (authority) =>
+        authority.tableId === snapshot.tableId &&
+        (authority.authorityTerm > snapshot.authorityTerm ||
+          (authority.authorityTerm === snapshot.authorityTerm &&
+            authority.hostRank < currentRank))
+    );
   }
 
   sessionEnded(
@@ -250,11 +465,20 @@ export class LanMultiplayer<
     if (this.activeSession === session) this.activeSession = null;
   }
 
-  async dispose(): Promise<void> {
-    await this.activeSession?.leaveGame();
+  async dispose(options: { preserveSession?: boolean } = {}): Promise<void> {
+    if (options.preserveSession) {
+      try {
+        await this.activeSession?.suspendConnection();
+      } finally {
+        this.activeSession?.dispose();
+      }
+    } else {
+      await this.activeSession?.leaveGame();
+    }
     await this.stopDiscovery();
     this.subscriptions.forEach((subscription) => subscription.remove());
     this.gamesListeners.clear();
+    this.strongestObservedAuthorities.clear();
   }
 
   private assertNoSession(): void {
@@ -370,6 +594,7 @@ export class LanMultiplayer<
     const wasVisible = this.gameLobbyMetadata.delete(serviceId);
     this.games.delete(serviceId);
     this.serviceHosts.delete(serviceId);
+    this.serviceAuthorities.delete(serviceId);
     if (this.discovering && wasVisible) {
       this.emitGames();
     }
@@ -380,6 +605,7 @@ export class LanMultiplayer<
     const removed = this.gameLobbyMetadata.delete(serviceId);
     this.games.delete(serviceId);
     this.serviceHosts.delete(serviceId);
+    this.serviceAuthorities.delete(serviceId);
     const watch = this.gameWatches.get(serviceId);
     if (watch) {
       clearTimeout(watch.timeout);
@@ -406,12 +632,16 @@ export class LanMultiplayer<
     );
   }
 
-  private async connectToGame(service: DiscoveredService, hostId: string | undefined, joinAttempt: number) {
+  private async connectToGame(
+    service: DiscoveredService,
+    tableId: string | undefined,
+    joinAttempt: number
+  ) {
     let lastError: unknown;
     for (let attempt = 0; attempt < CONNECT_ATTEMPTS; attempt += 1) {
       this.assertJoinActive(joinAttempt);
-      const currentService = hostId
-        ? [...this.serviceHosts].find(([, candidateHostId]) => candidateHostId === hostId)?.[0]
+      const currentService = tableId
+        ? [...this.serviceHosts].find(([, candidateTableId]) => candidateTableId === tableId)?.[0]
         : service.serviceId;
       try {
         return await ExpoLanSockets.connectToServiceAsync(currentService ?? service.serviceId);
@@ -426,16 +656,81 @@ export class LanMultiplayer<
   private assertJoinActive(attempt: number): void {
     if (attempt !== this.joinAttempt) throw new Error('Join cancelled');
   }
+
+  private assertRecoveryActive<State, GameEvent>(
+    attempt: number,
+    session: GameSession<State, GameEvent, ParticipantMetadata, LobbyMetadata>
+  ): void {
+    if (attempt !== this.recoveryAttempt || this.activeSession !== session) {
+      throw new Error('Recovery cancelled');
+    }
+  }
+
+  private bestRecoveryService(
+    tableId: string,
+    authorityTerm: number,
+    hostParticipantId: string,
+    hostOrder: readonly string[]
+  ): DiscoveredService | null {
+    const currentHostRank = hostOrder.indexOf(hostParticipantId);
+    const candidates = [...this.serviceAuthorities.entries()]
+      .filter(([, authority]) =>
+        authority.tableId === tableId &&
+        (authority.authorityTerm > authorityTerm ||
+          (authority.authorityTerm === authorityTerm && authority.hostRank <= currentHostRank))
+      )
+      .sort((left, right) =>
+        right[1].authorityTerm - left[1].authorityTerm ||
+        left[1].hostRank - right[1].hostRank
+      );
+    const serviceId = candidates[0]?.[0];
+    return serviceId ? this.games.get(serviceId) ?? null : null;
+  }
+
+  private async startSessionServer<State, GameEvent>(
+    session: GameSession<State, GameEvent, ParticipantMetadata, LobbyMetadata>,
+    visibleName: string
+  ): Promise<void> {
+    const snapshot = session.snapshot;
+    if (!snapshot.tableId || !snapshot.hostParticipantId) {
+      throw new Error('The host session is missing authority identity');
+    }
+    const name = (visibleName.trim() || 'LAN Game').slice(0, 20);
+    const hostRank = Math.max(0, snapshot.hostOrder.indexOf(snapshot.hostParticipantId));
+    const serviceName = [
+      name,
+      snapshot.tableId,
+      snapshot.authorityTerm.toString(36),
+      hostRank.toString(36),
+      randomId(),
+    ].join('~');
+    await ExpoLanSockets.startServerAsync({ serviceName, serviceType: SERVICE_TYPE });
+  }
 }
 
 function randomId(): string {
   return Math.random().toString(36).slice(2, 2 + SERVICE_ID_LENGTH).padEnd(SERVICE_ID_LENGTH, '0');
 }
 
-function parseAdvertisedName(name: string): { name: string; hostId: string } | null {
-  const match = name.match(/^(.*)~([a-z0-9]{6})~[a-z0-9]{6}$/);
+function parseAdvertisedName(name: string): AdvertisedGame | null {
+  const match = name.match(/^(.*)~([a-z0-9]{12})~([a-z0-9]+)~([a-z0-9]+)~[a-z0-9]{6}$/);
   if (!match) return null;
-  return { name: match[1] || 'LAN Game', hostId: match[2] };
+  const authorityTerm = Number.parseInt(match[3]!, 36);
+  const hostRank = Number.parseInt(match[4]!, 36);
+  if (!Number.isSafeInteger(authorityTerm) || !Number.isSafeInteger(hostRank)) return null;
+  return {
+    name: match[1] || 'LAN Game',
+    tableId: match[2]!,
+    authorityTerm,
+    hostRank,
+  };
+}
+
+function outranks(candidate: AdvertisedGame, current: AdvertisedGame): boolean {
+  return (
+    candidate.authorityTerm > current.authorityTerm ||
+    (candidate.authorityTerm === current.authorityTerm && candidate.hostRank < current.hostRank)
+  );
 }
 
 function delay(milliseconds: number): Promise<void> {
@@ -454,4 +749,44 @@ function isJsonValue(value: unknown): value is JsonValue {
   if (Array.isArray(value)) return value.every(isJsonValue);
   if (typeof value !== 'object') return false;
   return Object.values(value).every(isJsonValue);
+}
+
+function waitForConnected<
+  State,
+  GameEvent,
+  ParticipantMetadata extends JsonValue,
+  LobbyMetadata extends JsonValue,
+>(
+  session: GameSession<State, GameEvent, ParticipantMetadata, LobbyMetadata>,
+  timeoutMs: number,
+  isActive: () => boolean
+): Promise<void> {
+  if (session.snapshot.status === 'connected') return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let unsubscribe: () => void = () => undefined;
+    const finish = (error?: Error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      clearInterval(cancellationCheck);
+      unsubscribe();
+      if (error) reject(error);
+      else resolve();
+    };
+    const timeout = setTimeout(() => {
+      finish(new Error('The recovered host did not accept the participant'));
+    }, timeoutMs);
+    const cancellationCheck = setInterval(() => {
+      if (!isActive()) finish(new Error('Recovery cancelled'));
+    }, 100);
+    unsubscribe = session.subscribe((snapshot) => {
+      if (snapshot.status === 'connected') {
+        finish();
+      } else if (snapshot.status === 'left') {
+        finish(new Error(snapshot.error ?? 'The recovery identity was rejected'));
+      }
+    });
+    if (settled) unsubscribe();
+  });
 }

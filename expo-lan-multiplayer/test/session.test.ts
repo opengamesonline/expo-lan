@@ -100,9 +100,14 @@ class ClientTransport implements SessionTransport {
 
   constructor(
     private readonly hostTransport: HostTransport,
-    private readonly hostConnectionId: string,
-    private readonly clientConnectionId: string
+    private hostConnectionId: string,
+    private clientConnectionId: string
   ) {}
+
+  retarget(hostConnectionId: string, clientConnectionId: string): void {
+    this.hostConnectionId = hostConnectionId;
+    this.clientConnectionId = clientConnectionId;
+  }
 
   async sendAsync(connectionId: string, data: Uint8Array): Promise<void> {
     assert.equal(connectionId, this.clientConnectionId);
@@ -129,6 +134,7 @@ function createHost({
   minPlayers?: number;
   maxPlayers?: number;
 } = {}) {
+  let lobbyOffset = 0;
   const owner = new SessionOwner();
   const transport = new HostTransport();
   const session = GameSession.host<
@@ -150,7 +156,8 @@ function createHost({
     },
     getLobbyMetadata(participants) {
       return {
-        playerCount: participants.filter(({ metadata }) => metadata.role === 'player').length,
+        playerCount:
+          participants.filter(({ metadata }) => metadata.role === 'player').length + lobbyOffset,
         spectatorCount: participants.filter(({ metadata }) => metadata.role === 'spectator')
           .length,
         maxPlayers,
@@ -183,7 +190,14 @@ function createHost({
     },
   });
   transport.host = session;
-  return { owner, session, transport };
+  return {
+    owner,
+    session,
+    transport,
+    addLobbyPlayer() {
+      lobbyOffset += 1;
+    },
+  };
 }
 
 async function joinClient(
@@ -208,6 +222,23 @@ async function joinClient(
   await session.attachServer(clientConnectionId, name, { role });
   await settle();
   return { owner, session, transport };
+}
+
+async function reconnectClient(
+  host: ReturnType<typeof createHost>,
+  client: Awaited<ReturnType<typeof joinClient>>,
+  index = 9
+) {
+  const hostConnectionId = `host-resume-${index}`;
+  const clientConnectionId = `client-resume-${index}`;
+  client.transport.retarget(hostConnectionId, clientConnectionId);
+  host.transport.links.set(hostConnectionId, {
+    client: client.session,
+    clientConnectionId,
+  });
+  host.session.attachIncoming(hostConnectionId);
+  await client.session.attachResumedServer(clientConnectionId);
+  await settle();
 }
 
 async function watchHost(host: ReturnType<typeof createHost>, index = 1) {
@@ -311,6 +342,147 @@ test('removes a participant that leaves the lobby', async () => {
   assert.equal(client.owner.ended, 1);
 });
 
+test('resumes an unexpectedly disconnected participant with the same identity and state', async () => {
+  const host = createHost();
+  const client = await joinClient(host);
+  const originalSelf = client.session.snapshot.self!;
+  await host.session.startGame();
+  await client.session.sendGameEvent({ type: 'claimTile', tile: 4 });
+  await settle();
+  const stateBeforeDisconnect = client.session.snapshot.state;
+
+  host.transport.disconnect('host-1');
+  await settle();
+
+  assert.equal(client.session.snapshot.status, 'disconnected');
+  assert.equal(host.session.snapshot.participants.some(({ id }) => id === originalSelf.id), true);
+  assert.equal(host.session.snapshot.connectedParticipantIds.includes(originalSelf.id), false);
+  assert.deepEqual(client.session.snapshot.state, stateBeforeDisconnect);
+
+  await reconnectClient(host, client);
+
+  assert.equal(client.session.snapshot.status, 'connected');
+  assert.equal(client.session.snapshot.self?.id, originalSelf.id);
+  assert.equal(client.session.snapshot.self?.slot, originalSelf.slot);
+  assert.equal(host.session.snapshot.connectedParticipantIds.includes(originalSelf.id), true);
+  assert.deepEqual(client.session.snapshot.state, host.session.snapshot.state);
+});
+
+test('restores a persisted participant after the client process restarts', async () => {
+  const host = createHost();
+  const client = await joinClient(host);
+  const recovery = client.session.exportRecoveryState();
+  const selfId = client.session.snapshot.self!.id;
+  host.transport.disconnect('host-1');
+  await settle();
+
+  const owner = new SessionOwner();
+  const transport = new ClientTransport(host.transport, 'host-restored', 'client-restored');
+  const restored = GameSession.restore<
+    TileState,
+    TileEvent,
+    ParticipantMetadata,
+    LobbyMetadata
+  >(owner, transport, recovery, selfId);
+  transport.client = restored;
+  host.transport.links.set('host-restored', {
+    client: restored,
+    clientConnectionId: 'client-restored',
+  });
+  host.session.attachIncoming('host-restored');
+  await restored.attachResumedServer('client-restored');
+  await settle();
+
+  assert.equal(restored.snapshot.status, 'connected');
+  assert.equal(restored.snapshot.self?.id, selfId);
+  assert.equal(restored.snapshot.tableId, host.session.snapshot.tableId);
+  assert.deepEqual(restored.snapshot.participants, host.session.snapshot.participants);
+});
+
+test('lets the host release a disconnected lobby reservation', async () => {
+  const host = createHost();
+  const client = await joinClient(host);
+  const participantId = client.session.snapshot.self!.id;
+  host.transport.disconnect('host-1');
+  await settle();
+
+  await host.session.removeDisconnectedParticipant(participantId);
+  await settle();
+
+  assert.equal(host.session.snapshot.participants.some(({ id }) => id === participantId), false);
+  assert.equal(host.session.snapshot.hostOrder.includes(participantId), false);
+  assert.equal(host.session.exportRecoveryState().resumeTokens[participantId], undefined);
+});
+
+test('treats a revoked recovery identity as terminal', async () => {
+  const host = createHost();
+  const client = await joinClient(host);
+  const recovery = client.session.exportRecoveryState();
+  const selfId = client.session.snapshot.self!.id;
+  host.transport.disconnect('host-1');
+  await settle();
+  await host.session.removeDisconnectedParticipant(selfId);
+  await settle();
+
+  const owner = new SessionOwner();
+  const transport = new ClientTransport(host.transport, 'host-revoked', 'client-revoked');
+  const restored = GameSession.restore<
+    TileState,
+    TileEvent,
+    ParticipantMetadata,
+    LobbyMetadata
+  >(owner, transport, recovery, selfId);
+  transport.client = restored;
+  host.transport.links.set('host-revoked', {
+    client: restored,
+    clientConnectionId: 'client-revoked',
+  });
+  host.session.attachIncoming('host-revoked');
+  await restored.attachResumedServer('client-revoked');
+  await settle();
+
+  assert.equal(restored.snapshot.status, 'left');
+  assert.match(restored.snapshot.error ?? '', /no longer part|not valid/);
+  assert.equal(owner.ended, 1);
+  await restored.leaveGame();
+  assert.equal(owner.ended, 1);
+});
+
+test('promotes above the highest observed authority without changing identity or state', async () => {
+  const host = createHost();
+  const client = await joinClient(host);
+  await host.session.startGame();
+  await client.session.sendGameEvent({ type: 'claimTile', tile: 3 });
+  await settle();
+  const before = client.session.exportRecoveryState();
+  const self = client.session.snapshot.self!;
+  host.transport.disconnect('host-1');
+  await settle();
+
+  client.session.beginPromotion(
+    {
+      name: before.name,
+      participantName: self.name,
+      participantMetadata: self.metadata,
+      createInitialState: () => ({ tiles: Array(9).fill(null), playerIds: [] }),
+      getLobbyMetadata: () => before.lobbyMetadata,
+      reduceEvent(state, event, participant) {
+        const tiles = [...state.tiles];
+        if (event.type === 'claimTile') tiles[event.tile] = participant.slot;
+        return { ...state, tiles };
+      },
+    },
+    before.authorityTerm + 2
+  );
+  client.session.commitPromotion();
+
+  assert.equal(client.session.snapshot.role, 'host');
+  assert.equal(client.session.snapshot.self?.id, self.id);
+  assert.equal(client.session.snapshot.hostParticipantId, self.id);
+  assert.equal(client.session.snapshot.authorityTerm, before.authorityTerm + 3);
+  assert.deepEqual(client.session.snapshot.state, before.state);
+});
+
 test('notifies a client when the host closes the lobby', async () => {
   const host = createHost();
   const client = await joinClient(host);
@@ -318,8 +490,8 @@ test('notifies a client when the host closes the lobby', async () => {
   await host.session.leaveGame();
   await settle();
 
-  assert.equal(client.session.snapshot.status, 'disconnected');
-  assert.deepEqual(client.session.snapshot.participants.map(({ name }) => name), ['Client 1']);
+  assert.equal(client.session.snapshot.status, 'left');
+  assert.deepEqual(client.session.snapshot.participants.map(({ name }) => name), ['Host', 'Client 1']);
   assert.equal(host.owner.ended, 1);
 });
 
@@ -369,6 +541,62 @@ test('publishes live opaque lobby metadata when participants change', async () =
   });
 });
 
+test('lets the host refresh opaque lobby metadata for clients and watchers', async () => {
+  const host = createHost({ maxPlayers: 4 });
+  const client = await joinClient(host);
+  const watcher = await watchHost(host);
+
+  host.addLobbyPlayer();
+  await host.session.refreshLobbyMetadata();
+  await settle();
+
+  assert.equal(host.session.snapshot.lobbyMetadata?.playerCount, 3);
+  assert.equal(client.session.snapshot.lobbyMetadata?.playerCount, 3);
+  assert.deepEqual(watcher.messages.at(-1), {
+    v: PROTOCOL_VERSION,
+    kind: 'watching',
+    phase: 'lobby',
+    lobbyMetadata: { playerCount: 3, spectatorCount: 0, maxPlayers: 4 },
+  });
+  await assert.rejects(client.session.refreshLobbyMetadata(), /Only the host/);
+
+  await host.session.startGame();
+  await assert.rejects(host.session.refreshLobbyMetadata(), /already started/);
+});
+
+test('returns connected participants to the lobby and starts another round', async () => {
+  const host = createHost({ maxPlayers: 4 });
+  const client = await joinClient(host);
+  const participantIds = host.session.snapshot.participants.map(({ id }) => id);
+
+  await assert.rejects(client.session.returnToLobby(), /Only the host/);
+  await host.session.startGame();
+  await client.session.sendGameEvent({ type: 'claimTile', tile: 2 });
+  host.addLobbyPlayer();
+  await host.session.returnToLobby();
+  await settle();
+
+  assert.equal(host.session.snapshot.phase, 'lobby');
+  assert.equal(client.session.snapshot.phase, 'lobby');
+  assert.equal(host.session.snapshot.state, null);
+  assert.equal(client.session.snapshot.state, null);
+  assert.deepEqual(host.session.snapshot.participants.map(({ id }) => id), participantIds);
+  assert.deepEqual(client.session.snapshot.participants.map(({ id }) => id), participantIds);
+  assert.equal(client.session.snapshot.lobbyMetadata?.playerCount, 3);
+  assert.equal(host.session.snapshot.revision, 1);
+
+  await host.session.returnToLobby();
+  const latePlayer = await joinClient(host, 2);
+  await host.session.startGame();
+  await latePlayer.session.sendGameEvent({ type: 'claimTile', tile: 5 });
+  await settle();
+
+  assert.equal(host.session.snapshot.phase, 'started');
+  assert.equal(host.session.snapshot.state?.playerIds.length, 3);
+  assert.equal(host.session.snapshot.state?.tiles[5], latePlayer.session.snapshot.self?.slot);
+  assert.equal(client.session.snapshot.revision, 2);
+});
+
 test('closes watcher connections when the host cancels the game', async () => {
   const host = createHost();
   const watcher = await watchHost(host);
@@ -390,7 +618,12 @@ test('closes a host with multiple clients without rejected cleanup sends', async
   await settle();
 
   assert.equal(host.session.snapshot.status, 'left');
-  assert.deepEqual(host.session.snapshot.participants.map(({ name }) => name), ['Host']);
+  assert.deepEqual(host.session.snapshot.participants.map(({ name }) => name), [
+    'Host',
+    'Client 1',
+    'Client 2',
+    'Client 3',
+  ]);
 });
 
 test('rejects a late join after the game starts', async () => {

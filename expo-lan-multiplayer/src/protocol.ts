@@ -1,6 +1,11 @@
-import type { GamePhase, JsonValue, Participant } from './types';
+import type {
+  GamePhase,
+  JsonValue,
+  Participant,
+  SessionRecoveryState,
+} from './types';
 
-export const PROTOCOL_VERSION = 1;
+export const PROTOCOL_VERSION = 4;
 export const SERVICE_TYPE = '_expo-lan-game._tcp.';
 export const MAX_FRAME_BYTES = 64 * 1024;
 export const WATCH_ACK_TIMEOUT_MS = 2000;
@@ -14,26 +19,31 @@ export type WireMessage<
   | { kind: 'watch' }
   | { kind: 'watching'; phase: GamePhase; lobbyMetadata: LobbyMetadata }
   | { kind: 'join'; participantName: string; participantMetadata: ParticipantMetadata }
+  | { kind: 'resume'; tableId: string; participantId: string; resumeToken: string }
   | {
       kind: 'welcome';
       self: Participant<ParticipantMetadata>;
-      participants: Participant<ParticipantMetadata>[];
-      state: State | null;
-      revision: number;
-      phase: GamePhase;
-      lobbyMetadata: LobbyMetadata;
+      recovery: SessionRecoveryState<State, ParticipantMetadata, LobbyMetadata>;
     }
+  | { kind: 'sync'; recovery: SessionRecoveryState<State, ParticipantMetadata, LobbyMetadata> }
   | {
       kind: 'participantJoined';
       participant: Participant<ParticipantMetadata>;
       lobbyMetadata: LobbyMetadata;
     }
   | { kind: 'participantLeft'; participantId: string; lobbyMetadata: LobbyMetadata }
+  | { kind: 'participantDisconnected'; participantId: string }
+  | { kind: 'participantReconnected'; participantId: string }
+  | { kind: 'lobbyUpdated'; lobbyMetadata: LobbyMetadata }
+  | { kind: 'returnedToLobby'; lobbyMetadata: LobbyMetadata }
   | { kind: 'gameStarted'; state: State; revision: number }
   | { kind: 'gameEvent'; event: GameEvent }
+  | { kind: 'heartbeat'; sentAt: number }
+  | { kind: 'heartbeatAck'; sentAt: number }
   | { kind: 'state'; state: State; revision: number }
   | { kind: 'leave' }
-  | { kind: 'rejected'; reason: string }
+  | { kind: 'tableClosed' }
+  | { kind: 'rejected'; reason: string; terminal?: boolean }
 );
 
 const textEncoder = new TextEncoder();

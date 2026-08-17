@@ -3,6 +3,7 @@ import Network
 
 private let maxConnections = 32
 private let connectTimeout: TimeInterval = 10
+private let waitingTimeout: TimeInterval = 5
 
 private struct ServerOptions: Record {
   @Field
@@ -21,6 +22,7 @@ private final class ManagedConnection {
   var receiving = false
   var connectPromise: Promise?
   var timeoutWorkItem: DispatchWorkItem?
+  var waitingWorkItem: DispatchWorkItem?
 
   init(id: String, connection: NWConnection, incoming: Bool, promise: Promise?) {
     self.id = id
@@ -352,6 +354,8 @@ public final class ExpoLanSocketsModule: Module {
         guard self.connections[managed.id] === managed, !managed.closed else { return }
         switch state {
         case .ready:
+          managed.waitingWorkItem?.cancel()
+          managed.waitingWorkItem = nil
           guard !managed.opened else { return }
           managed.opened = true
           managed.timeoutWorkItem?.cancel()
@@ -373,6 +377,25 @@ public final class ExpoLanSocketsModule: Module {
           )
         case .cancelled:
           self.closeConnection(managed, reason: "remote_close", emit: managed.opened)
+        case .waiting(let error):
+          guard managed.waitingWorkItem == nil else { return }
+          let timeout = DispatchWorkItem { [weak self, weak managed] in
+            guard let self, let managed, !managed.closed else { return }
+            let message = self.networkErrorMessage(error, endpoint: managed.connection.endpoint)
+            managed.connectPromise?.reject("ERR_CONNECTION_FAILED", message)
+            managed.connectPromise = nil
+            self.closeConnection(
+              managed,
+              reason: "connection_error",
+              message: message,
+              emit: managed.opened
+            )
+          }
+          managed.waitingWorkItem = timeout
+          self.networkQueue.asyncAfter(deadline: .now() + waitingTimeout, execute: timeout)
+        case .preparing:
+          managed.waitingWorkItem?.cancel()
+          managed.waitingWorkItem = nil
         default:
           break
         }
@@ -468,6 +491,8 @@ public final class ExpoLanSocketsModule: Module {
     managed.closed = true
     managed.timeoutWorkItem?.cancel()
     managed.timeoutWorkItem = nil
+    managed.waitingWorkItem?.cancel()
+    managed.waitingWorkItem = nil
     connections.removeValue(forKey: managed.id)
     managed.connection.stateUpdateHandler = nil
     managed.connection.cancel()

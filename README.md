@@ -2,6 +2,9 @@
 
 Native LAN multiplayer transport and host-authoritative sessions for Expo applications.
 
+> [!CAUTION]
+> This is alpha, AI generated software. APIs may break change at any time. The goal is to iterate and clean up the codebase so it can be ready for use.
+
 ## Packages
 
 - `@opengamesonline/expo-lan-sockets` wraps Android `NsdManager`, `ServerSocket`, and `Socket` for native service discovery and TCP transport.

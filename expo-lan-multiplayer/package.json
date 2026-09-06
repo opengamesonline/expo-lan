@@ -6,7 +6,8 @@
   "react-native": "src/index.ts",
   "types": "build/index.d.ts",
   "files": [
-    "build"
+    "build",
+    "LICENSE"
   ],
   "scripts": {
     "build": "tsc",

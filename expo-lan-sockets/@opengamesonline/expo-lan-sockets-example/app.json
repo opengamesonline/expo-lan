@@ -1,0 +1,33 @@
+{
+  "expo": {
+    "name": "expo-lan-sockets-example",
+    "slug": "expo-lan-sockets-example",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "light",
+    "ios": {
+      "supportsTablet": true,
+      "infoPlist": {
+        "NSLocalNetworkUsageDescription": "Discover and connect to multiplayer games on your local network.",
+        "NSBonjourServices": [
+          "_expo-lan-game._tcp"
+        ]
+      },
+      "bundleIdentifier": "com.sudokuru.expolansocketsexample"
+    },
+    "android": {
+      "adaptiveIcon": {
+        "backgroundColor": "#E6F4FE",
+        "foregroundImage": "./assets/android-icon-foreground.png",
+        "backgroundImage": "./assets/android-icon-background.png",
+        "monochromeImage": "./assets/android-icon-monochrome.png"
+      },
+      "predictiveBackGestureEnabled": false,
+      "package": "com.sudokuru.expolansocketsexample"
+    },
+    "web": {
+      "favicon": "./assets/favicon.png"
+    }
+  }
+}
